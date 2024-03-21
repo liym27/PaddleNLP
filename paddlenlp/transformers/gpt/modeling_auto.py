@@ -35,7 +35,7 @@ from ...utils.converter import StateDictNameMapping
 from .. import PretrainedModel, register_base_model
 from ..model_outputs import BaseModelOutputWithPastAndCrossAttentions
 
-from ..sequence_parallel_utils import (
+from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     ScatterOp,
     mark_as_sequence_parallel_parameter,
 )
