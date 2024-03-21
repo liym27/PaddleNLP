@@ -1536,7 +1536,7 @@ function llm_gpt_dygraph_auto_bs8_fp32_DP2() {
         run_pretrain_auto.py \
         --model_name_or_path gpt2-medium-en \
         --tokenizer_name_or_path gpt2-medium-en \
-        --input_dir "../data" \
+        --input_dir "$gpt_data_path/data" \
         --output_dir "output/$task_name" \
         --split 949,50,1 \
         --max_seq_length 1024 \
@@ -1606,7 +1606,7 @@ function llm_gpt_dygraph_auto_bs8_fp32_DP2-MP2() {
         run_pretrain_auto.py \
         --model_name_or_path gpt2-medium-en \
         --tokenizer_name_or_path gpt2-medium-en \
-        --input_dir "../data" \
+        --input_dir "$gpt_data_path/data" \
         --output_dir $case_out_dir  \
         --split 949,50,1 \
         --max_seq_length 1024 \
@@ -1676,7 +1676,7 @@ function llm_gpt_dygraph_auto_bs8_fp32_DP2-MP2-PP2() {
         run_pretrain_auto.py \
         --model_name_or_path gpt2-medium-en \
         --tokenizer_name_or_path gpt2-medium-en \
-        --input_dir "../data" \
+        --input_dir "$gpt_data_path/data" \
         --output_dir $case_out_dir  \
         --split 949,50,1 \
         --max_seq_length 1024 \
@@ -1746,7 +1746,7 @@ function llm_gpt_dygraph_auto_bs8_fp16_DP2-MP2-PP2() {
         run_pretrain_auto.py \
         --model_name_or_path gpt2-medium-en \
         --tokenizer_name_or_path gpt2-medium-en \
-        --input_dir "../data" \
+        --input_dir "$gpt_data_path/data" \
         --output_dir $case_out_dir  \
         --split 949,50,1 \
         --max_seq_length 1024 \
@@ -1866,7 +1866,7 @@ function before_hook_for_gpt() {
             echo "GPT data downloaded"
         else
             # download data for gpt
-            mkdir ${gpt_data_path}/data;
+            mkdir -p ${gpt_data_path}/data;
             wget -O ${gpt_data_path}/data/gpt_en_dataset_300m_ids.npy https://bj.bcebos.com/paddlenlp/models/transformers/gpt/data/gpt_en_dataset_300m_ids.npy;
             wget -O ${gpt_data_path}/data/gpt_en_dataset_300m_idx.npz https://bj.bcebos.com/paddlenlp/models/transformers/gpt/data/gpt_en_dataset_300m_idx.npz;
         fi
