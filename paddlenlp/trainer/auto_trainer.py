@@ -22,10 +22,12 @@ import paddle
 import paddle.distributed as dist
 import paddle.nn as nn
 from paddle.distributed import fleet
+from paddle.distributed.auto_parallel.static.utils import print_program_with_dist_attr
 from tqdm.auto import tqdm
 
 from paddlenlp.trainer import Trainer
 
+from ..utils.import_utils import is_paddle_cuda_available
 from ..utils.log import logger
 from .argparser import strtobool
 from .trainer import SCALER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME, TRAINING_ARGS_NAME
@@ -48,6 +50,89 @@ except:
 MODEL_NAME = "model"
 OPTIMIZER_NAME = "optimizer"
 DIST_CKPT_PATH = "dist_ckpt"
+
+# 2: check convergence
+# 3: load and check accuracy
+# 4: load but not check accuracy
+RUN_MODE = 3
+
+RESET_INPUTS = False
+
+if RUN_MODE == 2:
+    RESET_INPUTS = False
+elif RUN_MODE == 3:
+    RESET_INPUTS = True
+else:
+    RESET_INPUTS = False
+
+# TAG = "single"
+# TAG = "dp2"
+# TAG = "mp2"
+# TAG = "dp2mp2"
+TAG = "dp2mp2pp2"
+FILE_PREFIX = "auto_" + TAG
+
+
+def log_loss(logs, file):
+    loss = logs["loss"]
+    global_step = logs["global_step"]
+    learning_rate = logs["learning_rate"]
+    # logwriter.add_scalar(tag=f"{TAG}/loss", value=loss, step=global_step)
+    # logwriter.add_scalar(tag=f"{TAG}/learning_rate", value=learning_rate, step=global_step)
+    # print(f"step {global_step} loss: {loss} md5: {loss._md5sum()} learning_rate: {learning_rate}")
+    file.write(f"step {global_step} loss: {loss} learning_rate: {learning_rate}\n")
+    file.flush()
+
+
+def reset_inputs(inputs):
+    inputs["input_ids"] = paddle.randint(0, 10000, (1, 1024))
+    inputs["labels"] = paddle.randint(0, 10000, (1, 1024))
+    return inputs
+
+
+def print_inputs(inputs, step):
+    input_ids, labels = inputs["input_ids"], inputs["labels"]
+    # print(f"\n[print_inputs global] step {step} input_ids: {input_ids.shape} {input_ids._md5sum()}, labels: {labels._md5sum()}")
+    print(
+        f"[print_inputs] step {step} input_ids: {input_ids._local_value().shape} {input_ids._local_value()._md5sum()}, labels: {labels._local_value()._md5sum()}"
+    )
+
+
+def print_grad(model):
+    print(f"-------------------print_grad------------------------------")
+    model_state_dict = model.state_dict()
+    name_mapping = {v.name: k for (k, v) in model_state_dict.items()}
+    for p in model.parameters():
+        assert p.name in name_mapping
+        if p.grad is not None:
+            print(f"[print_grad] {name_mapping[p.name]} {p.name}_grad {p.grad.shape} {p.grad._md5sum()}")
+    print(f"----------------------print_grad auto end -----------------------\n")
+
+
+def print_opt_param(state_dict):
+    print(f"-------------------print_opt_param------------------------------")
+    for k, v in state_dict.items():
+        if isinstance(v, dict):
+            print(f"[opt_param dict] {k} {len(v)}")
+            for k1, k2 in v.items():
+                print(f"  [opt_param dict] {k} {k1} {k2}")
+        else:
+            print(f"[opt_param local ] {k} {v._local_value().shape} {v._local_value()._md5sum()}")
+            print(f"[opt_param global] {k} {v.shape} {v._md5sum()}")
+    print(
+        f"----------------------print_opt_param auto end ----count = {len(state_dict.items())}------------------------\n"
+    )
+
+
+def print_param(model):
+    print(f"-------------------------------------------------")
+    model_state_dict = model.state_dict()
+    name_mapping = {v.name: k for (k, v) in model_state_dict.items()}
+    count = 0
+    for p in model.parameters():
+        count += 1
+        print(f"[print_param]{name_mapping[p.name]} {p.name} {p.shape} {p._md5sum()}")
+    print(f"---------------print_param end-------auto----count = {count}------------------------\n")
 
 
 class AutoTrainer(Trainer):
@@ -260,17 +345,42 @@ class AutoTrainer(Trainer):
             npu_accelerate_plugin(self.optimizer)
 
         model, dist_loader = self._wrap_for_auto(model, train_dataloader)
+        # if self.args.to_static:
+        #     print_program_with_dist_attr(model.dist_main_program())
         train_dataloader = dist_loader()
 
         self.timers and self.timers("read-data").start()
+        tt = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        hcg = fleet.get_hybrid_communicate_group()
+
+        dp_degree = hcg.get_data_parallel_world_size()
+        mp_degree = hcg.get_model_parallel_world_size()
+        pp_degree = hcg.get_pipe_parallel_world_size()
+
+        dp_rank = hcg.get_data_parallel_rank()
+        mp_rank = hcg.get_model_parallel_rank()
+        pp_rank = hcg.get_stage_id()
+
+        # self.file = open(f"./records/{FILE_PREFIX}_{tt}.txt", "w")
+        self.file = open(
+            f"./records/auto_dp{dp_degree:02d}mp{mp_degree:02d}pp{pp_degree:02d}_tostatic_{self.args.to_static}_fp16_{self.args.fp16}_bf16_{self.args.bf16}_{tt}.txt",
+            "w",
+        )
 
         for epoch in range(epochs_trained, num_train_epochs):
-
             step_control = 0  # used in loop control, reset to 0 after every step
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             # read global-batch from dist_loader
             for step, inputs in enumerate(train_dataloader):
+                # if step >= 1:
+                #     exit(0)
+                # print_inputs(inputs, step)
+                # print_param(model)
+                # print_grad(model)
+                # if step >= 1:
+                #     print_opt_param(self.optimizer.state_dict())
+
                 self.timers and self.timers("read-data").stop()
                 os.environ["TRAINER_GLOBAL_STEP"] = str(self.state.global_step)
                 self.callback_handler.on_load_data_end(args, self.state, self.control, inputs=inputs)
@@ -299,7 +409,8 @@ class AutoTrainer(Trainer):
 
                     with _exec_mode_guard("dynamic"):
                         tr_loss += tr_loss_step
-
+                        # logger.info(f"[YAMEI DEBUG] tr_loss : {tr_loss.numpy()}")
+                        # logwriter.add_scalar("gpt_auto_hybrid_loss", value=tr_loss.numpy(), step=step)
                     disable_accumulation = self.args.pipeline_parallel_degree > 1 and self.args.to_static
                     # disable_accumulation = self.args.to_static
 
@@ -355,7 +466,7 @@ class AutoTrainer(Trainer):
 
             if self.control.should_training_stop:
                 break
-
+        self.file.close()
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
             delattr(self, "_past")
@@ -388,7 +499,7 @@ class AutoTrainer(Trainer):
 
         return paddle.io.BatchSampler(
             dataset=self.train_dataset,
-            shuffle=True,
+            shuffle=False,
             batch_size=total_batch_size,
             drop_last=self.args.dataloader_drop_last,
         )
@@ -414,6 +525,10 @@ class AutoTrainer(Trainer):
             labels = None
 
         outputs = model(**inputs)
+        # print(f"outputs: {outputs}")
+        # print(
+        #     f"[yamei] logits: local {outputs._local_value().shape}  {outputs._local_value()._md5sum()} global {outputs.shape} {outputs._md5sum()}"
+        # )
 
         if self.criterion is not None:
 
@@ -517,9 +632,84 @@ class AutoTrainer(Trainer):
             # TODO: support optimizer_was_run in static mode
             self.lr_scheduler.step()
 
+    def _maybe_log_save_evaluate_back(self, tr_loss, model, epoch, ignore_keys_for_eval, **kwargs):
+        if self.control.should_log:
+
+            logs: Dict[str, float] = {}
+
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._get_item_from_loss(self._nested_gather(tr_loss).mean())
+
+            # reset tr_loss to zero
+            tr_loss.subtract_(tr_loss)
+
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 8)
+            logs["learning_rate"] = float("{0:.3e}".format(self._get_learning_rate()))
+            logs["global_step"] = int(self.state.global_step)
+
+            log_loss(logs, self.file)
+
+            total_train_batch_size = (
+                self.args.train_batch_size * self.args.gradient_accumulation_steps * self.args.dataset_world_size
+            )
+            num_steps = self.state.global_step - self._globalstep_last_logged
+            logs.update(
+                speed_metrics(
+                    "interval",
+                    self._globalstep_last_start_time,
+                    num_samples=total_train_batch_size * num_steps,
+                    num_steps=num_steps,
+                )
+            )
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self._globalstep_last_start_time = time.time()
+
+            # Add additional memory in log.
+            if not self.args.skip_memory_metrics:
+                logs.update(
+                    {
+                        "cpu_mem_used": self._memory_tracker.cpu_mem_used() >> 20,
+                        "cpu_mem_used_peak": self._memory_tracker.cpu_mem_used_peak >> 20,
+                    }
+                )
+                if is_paddle_cuda_available():
+                    logs.update(
+                        {
+                            "gpu_max_memory_allocated": paddle.device.cuda.max_memory_allocated() >> 20,
+                            "gpu_max_memory_reserved": paddle.device.cuda.max_memory_reserved() >> 20,
+                        }
+                    )
+
+            self.log(logs, **kwargs)
+
+        metrics = None
+        if self.control.should_evaluate:
+            if isinstance(self.optimizer, GroupShardedOptimizerStage2) and self.optimizer._broadcast_overlap:
+                paddle.device.cuda.synchronize()
+
+            if isinstance(self.eval_dataset, dict):
+                for eval_dataset_name, eval_dataset in self.eval_dataset.items():
+                    metrics = self.evaluate(
+                        eval_dataset=eval_dataset,
+                        ignore_keys=ignore_keys_for_eval,
+                        metric_key_prefix=f"eval_{eval_dataset_name}",
+                    )
+            else:
+                metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+
+        if self.control.should_save:
+            if isinstance(self.optimizer, GroupShardedOptimizerStage2) and self.optimizer._broadcast_overlap:
+                paddle.device.cuda.synchronize()
+
+            self._save_checkpoint(model, metrics=metrics)
+            logger.info(f"{self.runtime_timer.log()}")
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
     def _maybe_log_save_evaluate(self, tr_loss, model, epoch, ignore_keys_for_eval, **kwargs):
         with _exec_mode_guard("dynamic"):
-            super()._maybe_log_save_evaluate(tr_loss, model, epoch, ignore_keys_for_eval, **kwargs)
+            self._maybe_log_save_evaluate_back(tr_loss, model, epoch, ignore_keys_for_eval, **kwargs)
 
     def _save_checkpoint(self, model, metrics=None):
 

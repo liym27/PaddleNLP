@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import math
+import time
 from functools import partial
 
 import numpy as np
@@ -26,6 +27,7 @@ import paddle.incubate as incubate
 import paddle.nn as nn
 import paddle.nn.functional as F
 import paddle.tensor as tensor
+from paddle.autograd import PyLayer
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
@@ -73,6 +75,117 @@ __all__ = [
 ]
 
 
+def bias_attr_true():
+    return False
+
+
+def layer_norm_bias_attr_true():
+    return True
+
+
+def weight_grad(grad):
+    zero = paddle.zeros_like(grad)
+    return zero
+
+
+# only for dp2
+# def print_grad(forward_name, message="", concat_axis = None, dp_concat = True):
+#     def _print_grad(grad):
+#         print(f"\nprint_grad {forward_name}")
+#         print(f"[local  g {message}] {grad.shape} {grad._md5sum()}")
+#         print(grad)
+#     return _print_grad
+
+# def print_tensor(x, message="", concat_mp_axis = None, dp_concat = True, dp_reduce = False):
+#     print(f"\nprint_tensor {x.name}")
+#     print(f"[local  {message}] {x.shape} {x._md5sum()}")
+#     print(x)
+#     x.register_hook(print_grad(x.name, message, concat_mp_axis, dp_concat))
+
+# for dp mp
+
+
+def print_grad(forward_name, message="", concat_axis=None, dp_concat=True, dp_reduce=False):
+    def _print_grad(ori_grad):
+        grad = paddle.assign(ori_grad)
+
+        if dp_reduce:
+            grad = reduce_dp(grad)
+        if dp_concat:
+            dp_grad = concat_dp(grad)
+        else:
+            dp_grad = grad
+        if concat_axis is not None:
+            concat_grad = concat_mp(dp_grad, concat_axis)
+        else:
+            concat_grad = dp_grad
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {ori_grad.shape} {ori_grad._md5sum()}")
+        print(f"[global g {message}] {concat_grad.shape} {concat_grad._md5sum()}")
+
+        # print(grad)
+        # print(concat_grad)
+
+        # hcg = fleet.get_hybrid_communicate_group()
+        # dp_rank = hcg.get_global_rank()
+        # tt = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        if "w self.embeddings" in message:
+            print(grad)
+            print(concat_grad)
+            np.save(f"./debug_grad/hand_{forward_name}_ori_{tt}.txt", concat_grad.numpy())
+
+    return _print_grad
+
+
+def print_tensor(x, message="", concat_mp_axis=None, dp_concat=True, register_hook=True, grad_dp_reduce=False):
+    return
+    # print(f"\nprint_tensor {x.name}")
+    print(f"\nprint_tensor")
+    print(f"[local  {message}] {x.shape} {x._md5sum()}")
+    if dp_concat:
+        dp_x = concat_dp(x)
+    else:
+        dp_x = x
+    if concat_mp_axis is not None:
+        y = concat_mp(dp_x, concat_mp_axis)
+    else:
+        y = dp_x
+
+    print(f"[global {message}] {y.shape} {y._md5sum()}")
+    # print(x)
+    # print(y)
+    # if register_hook:
+    #     x.register_hook(
+    #         print_grad(x.name, message, concat_mp_axis, dp_concat,
+    #                    grad_dp_reduce))
+
+
+# def print_grad(forward_data, message="", concat_axis = None):
+#     def _print_grad(grad):
+#         if concat_axis is not None:
+#             concat_x = concat_mp(forward_data, concat_axis)
+#             concat_grad = concat_mp(grad, concat_axis)
+#         else:
+#             concat_x = forward_data
+#             concat_grad = grad
+#         print(f"\nprint_grad {forward_data.name}")
+#         print(f"[local  f {message}] {forward_data.shape} {forward_data._md5sum()}")
+#         print(f"[global f {message}] {concat_x.shape} {concat_x._md5sum()}")
+#         print(f"[local  g {message}] {grad.shape} {grad._md5sum()}")
+#         print(f"[global g {message}] {concat_grad.shape} {concat_grad._md5sum()}")
+#     return _print_grad
+
+# def print_tensor(x, message="", concat_axis = None):
+#     if concat_axis is not None:
+#         y = concat_mp(x, concat_axis)
+#     else:
+#         y = x
+#     print(f"\nprint_tensor {x.name}")
+#     print(f"[local  {message}] {x.shape} {x._md5sum()}")
+#     print(f"[global {message}] {y.shape} {y._md5sum()}")
+#     x.register_hook(print_grad(x, message, concat_axis))
+
+
 def get_triangle_upper_mask(x, mask=None):
     if mask is not None:
         return mask
@@ -97,7 +210,7 @@ def parallel_matmul(x: paddle.Tensor, y: paddle.Tensor, transpose_y=True, tensor
     except:
         is_fleet_init = False
 
-    if is_fleet_init and tensor_parallel_degree > 1 and y.is_distributed:
+    if is_fleet_init and tensor_parallel_degree > 1:  # and y.is_distributed:
         # if not running under distributed.launch, it will raise AttributeError: 'Fleet' object has no attribute '_hcg'
         input_parallel = paddle.distributed.collective._c_identity(x, group=model_parallel_group)
         logits = paddle.matmul(input_parallel, y, transpose_y=transpose_y)
@@ -194,7 +307,7 @@ class MultiHeadAttention(nn.Layer):
                 self.qkv_proj = ColumnParallelLinear(
                     config.hidden_size,
                     3 * config.hidden_size,
-                    has_bias=True,
+                    has_bias=bias_attr_true(),
                     gather_output=False,
                     fuse_matmul_bias=config.fused_linear,
                 )
@@ -202,7 +315,7 @@ class MultiHeadAttention(nn.Layer):
                 self.q_proj = ColumnParallelLinear(
                     config.hidden_size,
                     config.hidden_size,
-                    has_bias=True,
+                    has_bias=bias_attr_true(),
                     gather_output=False,
                     fuse_matmul_bias=config.fused_linear,
                 )
@@ -210,7 +323,7 @@ class MultiHeadAttention(nn.Layer):
                 self.k_proj = ColumnParallelLinear(
                     config.hidden_size,
                     config.hidden_size,
-                    has_bias=True,
+                    has_bias=bias_attr_true(),
                     gather_output=False,
                     fuse_matmul_bias=config.fused_linear,
                 )
@@ -218,7 +331,7 @@ class MultiHeadAttention(nn.Layer):
                 self.v_proj = ColumnParallelLinear(
                     config.hidden_size,
                     config.hidden_size,
-                    has_bias=True,
+                    has_bias=bias_attr_true(),
                     gather_output=False,
                     fuse_matmul_bias=config.fused_linear,
                 )
@@ -226,19 +339,18 @@ class MultiHeadAttention(nn.Layer):
             self.out_proj = RowParallelLinear(
                 config.hidden_size,
                 config.hidden_size,
-                has_bias=True,
+                has_bias=bias_attr_true(),
                 input_is_parallel=True,
                 fuse_matmul_bias=config.fused_linear,
             )
         else:
             if self.config.fuse_attention_qkv:
-                self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias_attr=True)
+                self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias_attr=bias_attr_true())
             else:
-                self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=True)
-                self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=True)
-                self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=True)
-
-            self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=True)
+                self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
+                self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
+                self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
+            self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
 
     def _fuse_prepare_qkv(self, query, use_cache=False, past_key_value=None):
         if self.config.sequence_parallel:
@@ -421,7 +533,7 @@ class TransformerDecoder(nn.Layer):
 
         self.config = config
         self.layers = decoder_layers
-        self.norm = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
+        self.norm = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=layer_norm_bias_attr_true())
 
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm.weight)
@@ -486,7 +598,6 @@ class TransformerDecoder(nn.Layer):
 
         for i, mod in enumerate(self.layers):
             has_gradient = not output.stop_gradient
-            # def forward(self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False):
             if self.enable_recompute and has_gradient and self.config.recompute_granularity == "full_attn":
                 outputs = self.recompute_training(
                     layer_module=mod,
@@ -514,6 +625,8 @@ class TransformerDecoder(nn.Layer):
 
         if self.norm is not None:
             output = self.norm(output)
+            print_tensor(self.norm.weight, f"w self.norm {self.norm.weight.name}", None, False)
+            print_tensor(output, "self.norm", None)
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
@@ -565,22 +678,22 @@ class GPTDecoderLayer(nn.Layer):
                 config.hidden_size,
                 config.intermediate_size,
                 gather_output=False,
-                has_bias=True,
+                has_bias=bias_attr_true(),
                 fuse_matmul_bias=self.config.fused_linear,
             )
             self.linear2 = RowParallelLinear(
                 config.intermediate_size,
                 config.hidden_size,
                 input_is_parallel=True,
-                has_bias=True,
+                has_bias=bias_attr_true(),
                 fuse_matmul_bias=self.config.fused_linear,
             )
         else:
-            self.linear1 = nn.Linear(config.hidden_size, config.intermediate_size, bias_attr=True)
-            self.linear2 = nn.Linear(config.intermediate_size, config.hidden_size, bias_attr=True)
+            self.linear1 = nn.Linear(config.hidden_size, config.intermediate_size, bias_attr=bias_attr_true())
+            self.linear2 = nn.Linear(config.intermediate_size, config.hidden_size, bias_attr=bias_attr_true())
 
-        self.norm1 = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
-        self.norm2 = nn.LayerNorm(config.hidden_size, epsilon=1e-5)
+        self.norm1 = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=layer_norm_bias_attr_true())
+        self.norm2 = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=layer_norm_bias_attr_true())
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm1.weight)
             mark_as_sequence_parallel_parameter(self.norm1.bias)
@@ -605,9 +718,12 @@ class GPTDecoderLayer(nn.Layer):
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         residual = hidden_states
+        print_tensor(hidden_states, "hidden_states and residual")
 
         if self.config.normalize_before:
             hidden_states = self.norm1(hidden_states)
+            print_tensor(self.norm1.weight, f"w self.norm1 {self.norm1.weight.name}", None, False, grad_dp_reduce=True)
+            print_tensor(hidden_states, "norm1")
         # self.self_attn:
         # def forward(
         #     self, query, key, value, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False
@@ -630,6 +746,7 @@ class GPTDecoderLayer(nn.Layer):
             hidden_states = self.self_attn(
                 hidden_states, None, None, attention_mask, use_cache, past_key_value, output_attentions
             )
+            print_tensor(hidden_states, "self.self_attn")
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         incremental_cache = hidden_states[-1] if use_cache else None
@@ -645,27 +762,49 @@ class GPTDecoderLayer(nn.Layer):
                 hidden_states = self.fused_dropout_add1(hidden_states, residual)
             else:
                 hidden_states = residual + self.dropout1(hidden_states)
+                print_tensor(hidden_states, "dropout1")
 
-        if not self.config.normalize_before:
-            hidden_states = self.norm1(hidden_states)
+        # if not self.config.normalize_before:
+        #     hidden_states = self.norm1(hidden_states)
+        #     print_tensor(hidden_states, "norm1")
 
         residual = hidden_states
         if self.config.normalize_before:
             hidden_states = self.norm2(hidden_states)
+            print_tensor(self.norm2.weight, f"w self.norm2 {self.norm2.weight.name}", None, False, grad_dp_reduce=True)
+            print_tensor(hidden_states, "norm2")
 
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         with seed_guard_context(current_seed):
             if not self.config.use_fused_dropout_add:
-                hidden_states = residual + self.dropout2(
-                    self.linear2(self.activation(self.linear1(hidden_states), approximate=True))
+                # hidden_states = residual + self.dropout2(
+                #     self.linear2(self.activation(self.linear1(hidden_states), approximate=True))
+                # )
+                # print_tensor(hidden_states, "dropout2")
+                a = self.linear1(hidden_states)
+                print_tensor(
+                    self.linear1.weight, f"w linear1 {self.linear1.weight.name}", -1, False, grad_dp_reduce=True
                 )
+                print_tensor(a, "linear1", concat_mp_axis=-1)
+                b = self.activation(a, approximate=True)
+                print_tensor(b, "self.activation", -1)
+                c = self.linear2(b)
+                print_tensor(
+                    self.linear2.weight, f"w linear2 {self.linear2.weight.name}", 0, False, grad_dp_reduce=True
+                )
+                print_tensor(c, "linear2")
+                d = self.dropout2(c)
+                print_tensor(d, "dropout2")
+                hidden_states = residual + d
+                print_tensor(hidden_states, "add")
             else:
                 hidden_states = self.fused_dropout_add2(
                     self.linear2(self.activation(self.linear1(hidden_states), approximate=True)), residual
                 )
-        if not self.config.normalize_before:
-            hidden_states = self.norm2(hidden_states)
+        # if not self.config.normalize_before:
+        #     hidden_states = self.norm2(hidden_states)
+        #     print_tensor(hidden_states, "norm2")
 
         if not (output_attentions or use_cache):
             return hidden_states
@@ -714,6 +853,15 @@ class GPTEmbeddings(nn.Layer):
         if input_ids is not None:
             input_shape = paddle.shape(input_ids)
             inputs_embeddings = self.word_embeddings(input_ids)
+            print_tensor(input_ids, "word_embeddings x", register_hook=False)
+            print_tensor(inputs_embeddings, "word_embeddings y")
+            print_tensor(
+                self.word_embeddings.weight,
+                f"word_embeddings weight {self.word_embeddings.weight.name}",
+                concat_mp_axis=0,
+                dp_concat=False,
+                grad_dp_reduce=True,
+            )
         else:
             input_shape = paddle.shape(inputs_embeddings)[:-1]
 
@@ -1152,6 +1300,12 @@ class GPTModel(GPTPretrainedModel):
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, inputs_embeddings=inputs_embeds
         )
+        # print_tensor(
+        #     self.embeddings.word_embeddings.weight,
+        #     f"w self.embeddings {self.embeddings.word_embeddings.weight.name}",
+        #     concat_mp_axis=0,
+        #     dp_concat=False)
+        print_tensor(embedding_output, "self.embeddings")
 
         # TODO, use registered buffer
         length = input_shape[-1]
@@ -1195,6 +1349,29 @@ class GPTModel(GPTPretrainedModel):
         return outputs
 
 
+def concat_dp_with_grad(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_degree = hcg.get_data_parallel_world_size()
+    if dp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_data_parallel_group()
+        paddle.distributed.get_rank(group)
+        return Concat.apply(input, 0, group)
+
+
+def reduce_dp(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_degree = hcg.get_data_parallel_world_size()
+    if dp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_data_parallel_group()
+        with paddle.no_grad():
+            paddle.distributed.all_reduce(input, group=group)
+            return input
+
+
 class GPTPretrainingCriterion(paddle.nn.Layer):
     """
     Criterion for GPT. It calculates the final loss.
@@ -1207,6 +1384,7 @@ class GPTPretrainingCriterion(paddle.nn.Layer):
             self.loss_func = fleet.meta_parallel.ParallelCrossEntropy(ignore_index=config.ignore_index)
         else:
             self.loss_func = paddle.nn.CrossEntropyLoss(reduction="none", ignore_index=config.ignore_index)
+        # self.loss_func = paddle.nn.CrossEntropyLoss(reduction="none", ignore_index=config.ignore_index)
 
     def forward(self, prediction_scores, masked_lm_labels, loss_mask=None):
         """
@@ -1227,14 +1405,28 @@ class GPTPretrainingCriterion(paddle.nn.Layer):
             Tensor: The pretraining loss. Its data type should be float32 and its shape is [1].
 
         """
+        # with paddle.amp.auto_cast(False):
+        #     masked_lm_loss = self.loss_func(prediction_scores.astype("float32"), masked_lm_labels.unsqueeze(2))
+        #     print_tensor(masked_lm_loss, "loss_func", dp_concat=True)
+        #     # masked_lm_loss = concat_dp_with_grad(masked_lm_loss)
+        #     # skip ignore_index which loss == 0
+        #     if loss_mask is None:
+        #         loss_mask = (masked_lm_loss > 0).astype("float32")
+        #         loss_mask = loss_mask.reshape([-1])
+        #         print_tensor(masked_lm_loss, "loss_mask", dp_concat=True)
+        #     masked_lm_loss = paddle.sum(masked_lm_loss.reshape([-1]) * loss_mask)
+        #     print_tensor(masked_lm_loss, "loss sum", None, False)
+        #     loss = masked_lm_loss / loss_mask.sum()
+        #     print_tensor(loss, "loss mead", None, False)
+
         with paddle.amp.auto_cast(False):
             masked_lm_loss = self.loss_func(prediction_scores.astype("float32"), masked_lm_labels.unsqueeze(2))
-            # skip ignore_index which loss == 0
-            if loss_mask is None:
-                loss_mask = (masked_lm_loss > 0).astype("float32")
-                loss_mask = loss_mask.reshape([-1])
-            masked_lm_loss = paddle.sum(masked_lm_loss.reshape([-1]) * loss_mask)
-            loss = masked_lm_loss / loss_mask.sum()
+            print_tensor(masked_lm_loss, "loss_func", dp_concat=False)
+            masked_lm_loss = masked_lm_loss[masked_lm_loss > 0]
+            # print_tensor(masked_lm_loss, "masked_select", None, True)
+            loss = paddle.mean(masked_lm_loss)
+            print_tensor(loss, "loss mean", None, False)
+
         return loss
 
 
@@ -1365,10 +1557,77 @@ class GPTLMHead(nn.Layer):
         if tensor_parallel_output is None:
             tensor_parallel_output = self.config.tensor_parallel_output
 
+        # y = paddle.assign(self.weight)
+
+        # y.stop_gradient = True
+        # self.weight.register_hook(weight_grad)
+
         logits = parallel_matmul(
             hidden_states, self.weight, transpose_y=self.transpose_y, tensor_parallel_output=tensor_parallel_output
         )
+
+        # tmp_w = concat_mp(self.weight, 0)
+        # tmp_l = concat_mp(logits, -1)
+
         return logits
+
+
+def concat(input, axis, group):
+    with paddle.no_grad():
+        inps = []
+        paddle.distributed.all_gather(inps, input, group=group)
+        return paddle.concat(x=inps, axis=axis)
+
+
+def concat_dp(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_degree = hcg.get_data_parallel_world_size()
+    if dp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_data_parallel_group()
+        return concat(input, 0, group)
+
+
+def concat_mp(input, axis=-1):
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_degree = hcg.get_model_parallel_world_size()
+    if mp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_model_parallel_group()
+        return concat(input, axis, group)
+
+
+def concat_mp_with_grad(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_degree = hcg.get_model_parallel_world_size()
+    if mp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_model_parallel_group()
+        return Concat.apply(input, -1, group)
+
+
+class Concat(PyLayer):
+    @staticmethod
+    def forward(ctx, inp, axis, group):
+        inputs = []
+        paddle.distributed.all_gather(inputs, inp, group=group)
+        with paddle.no_grad():
+            cat = paddle.concat(inputs, axis=axis)
+        ctx.args_axis = axis
+        ctx.args_group = group
+        return cat
+
+    @staticmethod
+    def backward(ctx, grad):
+        axis = ctx.args_axis
+        group = ctx.args_group
+        with paddle.no_grad():
+            grads = paddle.split(grad, paddle.distributed.get_world_size(group), axis=axis)
+        grad = grads[paddle.distributed.get_rank(group)]
+        return grad
 
 
 class GPTForCausalLM(GPTPretrainedModel):
@@ -1455,38 +1714,55 @@ class GPTForCausalLM(GPTPretrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        print_tensor(outputs, "outputs")
+
         if isinstance(outputs, input_type):
             hidden_states = outputs
         else:
             hidden_states = outputs[0]
 
+        print_tensor(hidden_states, "self.gpt")
         logits = self.lm_head(hidden_states)
 
-        loss = None
-        if labels is not None:
-            loss = self.criterion(logits, labels)
-            # # Shift so that tokens < n predict n
-            # shift_logits = logits[:, :-1, :]
-            # shift_labels = labels[:, 1:]
-            # # Flatten the tokens
-            # loss_fct = CrossEntropyLoss()
-            # loss = loss_fct(shift_logits.reshape((-1, shift_logits.shape[-1])), shift_labels.reshape((-1,)))
+        # print_tensor(hidden_states, "matmul x")
+        # y = paddle.assign(self.gpt.embeddings.word_embeddings.weight)
+        # y.stop_gradient = True
+        # print_tensor(y, "matmul y", 0, False, register_hook=True, grad_dp_reduce=True)
+        # logits = parallel_matmul(
+        #     hidden_states, y, transpose_y=True, tensor_parallel_output=self.config.tensor_parallel_output
+        # )
 
-        # outputs = [output, all_hidden_states, new_caches, all_self_attentions]
-        if not return_dict:
-            if isinstance(outputs, input_type):
-                return (loss, logits) if loss is not None else logits
+        # print_tensor(logits, "logits 1", -1)
+        # logits = concat_mp_with_grad(logits)
+        # print_tensor(logits, "logits 2")
+        return logits
 
-            outputs = (logits,) + outputs[1:]
-            return ((loss,) + outputs) if loss is not None else outputs
-        return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-        )
+        # 该步计算在外边
+        # loss = None
+        # if labels is not None:
+        #     loss = self.criterion(logits, labels)
+        #     # # Shift so that tokens < n predict n
+        #     # shift_logits = logits[:, :-1, :]
+        #     # shift_labels = labels[:, 1:]
+        #     # # Flatten the tokens
+        #     # loss_fct = CrossEntropyLoss()
+        #     # loss = loss_fct(shift_logits.reshape((-1, shift_logits.shape[-1])), shift_labels.reshape((-1,)))
+
+        # # outputs = [output, all_hidden_states, new_caches, all_self_attentions]
+        # if not return_dict:
+        #     if isinstance(outputs, input_type):
+        #         return (loss, logits) if loss is not None else logits
+
+        #     outputs = (logits,) + outputs[1:]
+        #     return ((loss,) + outputs) if loss is not None else outputs
+        # return CausalLMOutputWithCrossAttentions(
+        #     loss=loss,
+        #     logits=logits,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        #     cross_attentions=outputs.cross_attentions,
+        # )
 
     def prepare_fast_entry(self, kwargs):
         from paddlenlp.ops import FasterGPT

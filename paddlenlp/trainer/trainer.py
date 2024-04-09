@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import hashlib
 import paddle
 import paddle.amp.auto_cast as autocast
 import paddle.distributed as dist
@@ -167,6 +166,31 @@ SCHEDULER_NAME = "scheduler.pdparams"
 SCALER_NAME = "scaler.pdparams"
 
 
+# 1: save;
+# 2: check convergence
+# 3: load and check accuracy
+RUN_MODE = 1
+
+SAVE_MODEL = True
+LOAD_MODEL = True
+# RESET_INPUTS = False
+SAVE_MODEL_STEP = 1000
+LOG_LOSS = True
+
+if RUN_MODE == 1:
+    SAVE_MODEL = True
+    LOAD_MODEL = False
+    # RESET_INPUTS = False
+    LOG_LOSS = False
+elif RUN_MODE == 2:
+    SAVE_MODEL = False
+    LOAD_MODEL = False
+    # RESET_INPUTS = False
+else:  # RUN_MODE == 3:
+    SAVE_MODEL = False
+    LOAD_MODEL = True
+    # RESET_INPUTS = True
+
 if is_datasets_available():
     import datasets
 
@@ -183,6 +207,389 @@ except:
 
 
 __all__ = ["Trainer"]
+
+from paddlenlp.trainer.utils.reshard import NodeModelState, all_gather_state_dict
+
+# TAG = "single"
+# TAG = "dp2"
+# TAG = "mp2"
+# TAG = "dp2mp2"
+TAG = "dp2mp2pp2"
+FILE_PREFIX = "hand_" + TAG
+
+
+def log_loss(logs, file):
+    loss = logs["loss"]
+    global_step = logs["global_step"]
+    learning_rate = logs["learning_rate"]
+    # logwriter.add_scalar(tag=f"{TAG}/loss", value=loss, step=global_step)
+    # logwriter.add_scalar(tag=f"{TAG}/learning_rate", value=learning_rate, step=global_step)
+
+    file.write(f"step {global_step} loss: {loss} learning_rate: {learning_rate}\n")
+    file.flush()
+
+
+def map_structure_name(k):
+    hcg = fleet.get_hybrid_communicate_group()
+    pp_degree = hcg.get_pipe_parallel_world_size()
+    if "_layers.gpt." in k or pp_degree < 2:  # 注意是 "_layers.gpt.",有2个点
+        result = k
+    elif "word_embeddings" in k:
+        result = "_layers.gpt.embeddings.word_embeddings.weight"
+    elif "position_embeddings" in k:
+        result = "_layers.gpt.embeddings.position_embeddings.weight"
+    elif "shared_layers" in k:
+        result = "_layers.lm_head.weight"
+    else:
+        fs = k.split(".")
+        idx = int(fs[1])
+        if idx == 25:
+            result = f"_layers.gpt.norm." + ".".join(fs[2:])
+        else:
+            result = f"_layers.gpt.layers.{idx-1}." + ".".join(fs[2:])
+    return result
+
+
+def merge_tensor(name, tensor_list, fuse_num, axis):
+    if fuse_num > 1:
+        part_list = [paddle.split(e, num_or_sections=fuse_num, axis=axis) for e in tensor_list]
+        fuse_list = [paddle.concat(x=e, axis=axis) for e in zip(*part_list)]
+        merged_tensor = paddle.concat(x=fuse_list, axis=axis)
+    else:
+        merged_tensor = paddle.concat(x=tensor_list, axis=axis)
+    # logger.info(f"[YAMEI DEBUG] merge_tensor name: {name}, fuse_num: {fuse_num}, axis: {axis}, merged shape: {merged_tensor.shape}")
+    return merged_tensor
+
+
+def merge_mp_tensor_list(ori_k, tensor_list):
+    # self attention
+    k = map_structure_name(ori_k)
+
+    if "self_attn.qkv_proj.weight" in k:
+        return merge_tensor(k, tensor_list, 3, 1)  # merge by col
+    elif "self_attn.qkv_proj.bias" in k:
+        return merge_tensor(k, tensor_list, 3, 0)
+
+    elif "self_attn.q_proj.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 1)  # merge by col
+    elif "self_attn.q_proj.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+
+    elif "self_attn.k_proj.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 1)
+    elif "self_attn.k_proj.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+
+    elif "self_attn.v_proj.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 1)
+    elif "self_attn.v_proj.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+
+    elif "self_attn.out_proj.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 0)  # merge by row
+    elif "self_attn.out_proj.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 1)
+
+    # decoder
+    elif "linear1.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 1)
+    elif "linear1.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+    elif "linear2.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+    elif "linear2.bias" in k:
+        return merge_tensor(k, tensor_list, 1, 1)
+    # embedding
+    elif "word_embeddings.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+    elif "position_embeddings.weight" in k:
+        return tensor_list[0]
+    #     return merge_tensor(k, tensor_list, 1, 0)
+    # lm head
+    elif "lm_head.weight" in k:
+        return merge_tensor(k, tensor_list, 1, 0)
+    else:
+        assert "norm" in k, f"\nori_k: {ori_k}\nk    : {k} \nshape: {tensor_list}"
+        # duplicate
+        return tensor_list[0]
+
+
+def get_mesh(pp_idx=0):
+    mesh = fleet.auto.get_mesh()
+    if "pp" in mesh.dim_names:
+        mesh = mesh.get_mesh_with_dim("pp")[pp_idx]
+    return mesh
+
+
+def shard_fn(layer, mesh_idx, placements):
+    paran_name = layer.weight.name
+    layer.weight = dist.shard_tensor(layer.weight, get_mesh(mesh_idx), placements)
+    layer.weight.name = paran_name
+
+
+def shard_model(model):
+    pp_stage = 0
+    for name, layer in model.named_sublayers(include_self=False):
+        if hasattr(layer, "ipp"):
+            pp_stage = layer.ipp
+        # print(f"name {name},pp_stage {pp_stage}==>", type(layer))
+        if "word_embeddings" in name or "position_embeddings" in name:
+            # embedding only support column split now. it will update in the future
+            shard_fn(layer, 0, [dist.Replicate(), dist.Shard(1)])
+        for n in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.qkv_proj",
+            "linear1",
+        ]:
+            if n in name:
+                shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(1)])
+                break
+        for n in ["self_attn.out_proj", "linear2"]:
+            if n in name:
+                shard_fn(layer, pp_stage, [dist.Replicate(), dist.Shard(0)])
+                break
+        if "lm_head" in name:
+            shard_fn(layer, -1, [dist.Replicate(), dist.Shard(1)])
+
+
+def save_model_yamei_sigle(model):
+    state_dict = model.state_dict()
+    paddle.save(state_dict, f"{FILE_PREFIX}/single.pdparams")
+    print(f"========save_model_yamei_sigle state_dict ")
+    count = 0
+    for (k, v) in state_dict.items():
+        count += 1
+        print(f"{count}: {k}=>{v.name} {v.shape}")
+    print(f"========save_model_yamei_sigle end count={count}")
+
+
+def save_model_yamei(model):
+    # save_model_yamei_sigle(model)
+    # return
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_rank = hcg.get_data_parallel_rank()
+    mp_degree = hcg.get_model_parallel_world_size()
+    mp_rank = hcg.get_model_parallel_rank()
+    pp_rank = hcg.get_stage_id()
+    if dp_rank > 0:
+        return
+    state_dict = model.state_dict()
+    print(f"[YAMEI DEBUG]========save_model_yamei state_dict dp{dp_rank:02d}mp{mp_rank:02d}pp{pp_rank:02d}")
+    count = 0
+    for (k, v) in state_dict.items():
+        count += 1
+        print(f"{count}: {k}=>{v.name} {v.shape}")
+    print(f"[YAMEI DEBUG]========save_model_yamei end count={count} dp{dp_rank:02d}mp{mp_rank:02d}pp{pp_rank:02d}")
+    paddle.save(state_dict, f"{FILE_PREFIX}/pp{pp_rank:02d}mp{mp_rank:02d}.pdparams")
+    group = hcg.get_model_parallel_group()
+
+    # evenly ditribute param
+    node_model_state = NodeModelState()
+    node_model_state.add_weights(state_dict, mp_rank)
+
+    def merge_func(k, v):
+        assert len(v) == mp_degree
+        tensor_list = [e[1] for e in v]
+        result = merge_mp_tensor_list(k, tensor_list)
+        print(f"[YAMEI0220] merge_mp_tensor_list {k}=>{result.shape}")
+        return result
+
+    node_model_state = node_model_state.even_distribute(group)
+    node_model_state = node_model_state.collapse_key().merge_items(merge_func)
+
+    def filter_func(name):
+        return True
+
+    all_state_dict = all_gather_state_dict(node_model_state.model_weights, filter_func, group)
+    if mp_rank > 0:
+        return
+    paddle.save(all_state_dict, f"{FILE_PREFIX}/pp{pp_rank:02d}.pdparams")
+    group = hcg.get_pipe_parallel_group()
+    all_state_dict = all_gather_state_dict(all_state_dict, filter_func, group)
+    if pp_rank > 0:
+        return
+    paddle.save(all_state_dict, f"{FILE_PREFIX}/all.pdparams")
+
+
+# 动手
+def load_model_hand_yamei(model):
+    print(f"========load_model_hand_yamei {FILE_PREFIX} start=======")
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_rank = hcg.get_model_parallel_rank()
+    pp_rank = hcg.get_stage_id()
+
+    model_state_dict = model.state_dict()
+    state_dict = paddle.load(f"{FILE_PREFIX}/pp{pp_rank:02d}mp{mp_rank:02d}.pdparams")
+    # state_dict = paddle.load(f"{FILE_PREFIX}/pp{pp_rank:02d}mp{mp_rank:02d}.pdparams")
+    model.set_state_dict(state_dict)
+
+    count = 0
+    for (k, v) in state_dict.items():
+        # assert k in model_state_dict
+        print(f"[load model]{k}=>{v.shape}=>md5:{v._md5sum()}")
+        count += 1
+    print(f"========load_model_hand_yamei end count = {count}=======")
+
+
+def load_opt_hand_yamei(opt):
+    print(f"========load_opt_hand_yamei hand_dp2mp2 start=======")
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_rank = hcg.get_model_parallel_rank()
+    pp_rank = hcg.get_stage_id()
+
+    state_dict = paddle.load(f"hand_mp2/pp{pp_rank:02d}mp{mp_rank:02d}.pdopt")
+    opt.set_state_dict(state_dict)
+
+    print_opt_param(opt)
+    print(f"========load_model_hand_yamei end count = {len(state_dict.items())}=======")
+
+
+def load_model_hand_yamei_2(model):
+    print(f"========load_model_hand_yamei hand_dp2mp2/all.pdparams start=======")
+    state_dict = paddle.load(f"hand_dp2mp2/all.pdparams")
+    model.set_state_dict(state_dict)
+    logger.info(f"[YAMEI DEBUG] set state-dict :{model.set_state_dict(state_dict)}")
+    count = 0
+    for k, v in state_dict.items():
+        print(f"[load model]{k}=>{v.shape}=>md5:{v._md5sum()}")
+        count += 1
+    print(f"========load_model_hand_yamei hand_dp2mp2/all.pdparams end count = {count}=======")
+
+    return
+
+
+def reset_inputs(inputs):
+    inputs["input_ids"] = paddle.randint(0, 10000, (1, 1024))
+    inputs["labels"] = paddle.randint(0, 10000, (1, 1024))
+    return inputs
+
+
+def reduce_dp(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_degree = hcg.get_data_parallel_world_size()
+    if dp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_data_parallel_group()
+        with paddle.no_grad():
+            paddle.distributed.all_reduce(input, group=group)
+            return input
+
+
+def merge_mp(k, input):
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_degree = hcg.get_model_parallel_world_size()
+    if mp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_model_parallel_group()
+        with paddle.no_grad():
+            inps = []
+            paddle.distributed.all_gather(inps, input, group=group)
+            return merge_mp_tensor_list(k, inps)
+
+
+def print_inputs(inputs, step):
+    input_ids, labels = inputs["input_ids"], inputs["labels"]
+    print(
+        f"\n[print_inputs] step {step} input_ids: {input_ids.shape} {input_ids._md5sum()}, labels: {labels._md5sum()}"
+    )
+
+
+def print_opt_param(state_dict):
+    print(f"-------------------print_opt_param------------------------------")
+    for k, v in state_dict.items():
+        if isinstance(v, dict):
+            print(f"[opt_param dict] {k} {len(v)}")
+            for k1, k2 in v.items():
+                print(f"  [opt_param dict] {k} {k1} {k2}")
+        else:
+            print(f"[opt_param local ] {k[:-2]} {v.shape} {v._md5sum()}")
+            # p_tmp = concat_dp(v)
+            p_tmp = v
+            axis = None
+            shape = p_tmp.shape
+            if len(shape) == 2 and (shape[0] == 25152 or shape[0] == 512 or shape[0] == 2048):
+                axis = 0
+            elif len(shape) == 2 and (shape[1] == 25152 or shape[1] == 512 or shape[1] == 2048):
+                axis = 1
+            if axis is not None:
+                p_tmp = concat_mp(p_tmp, axis)
+            print(f"[opt_param global] {k[:-2]} {p_tmp.shape} {p_tmp._md5sum()}")
+    print(
+        f"----------------------print_opt_param hand end ----count = {len(state_dict.items())}------------------------\n"
+    )
+
+
+def print_param(model):
+    print(f"----------------------print_param---------------------------")
+    model_state_dict = model.state_dict()
+    name_mapping = {v.name: k for (k, v) in model_state_dict.items()}
+    count = 0
+    for p in model.parameters():
+        count += 1
+        p_tmp = p
+        axis = None
+        if "bias" in name_mapping[p.name]:
+            pass
+        else:
+            for n in ["q_proj", "k_proj", "v_proj", "qkv_proj", "linear1"]:
+                if n in name_mapping[p.name]:
+                    axis = -1
+                    break
+            for n in ["out_proj", "linear2", "word_embeddings", "lm_head"]:
+                if n in name_mapping[p.name]:
+                    axis = 0
+                    break
+        if axis is not None:
+            p_tmp = concat_mp(p_tmp, axis)
+        print(f"[print_param]{name_mapping[p.name][8:]} {p.name} {p_tmp.shape} {p_tmp._md5sum()}")
+
+    print(f"----------------------print_param hand end ----count = {count}------------------------\n")
+
+
+def print_grad(model):
+    print(f"-------------------print_grad------------------------------")
+    model_state_dict = model.state_dict()
+    name_mapping = {v.name: k for (k, v) in model_state_dict.items()}
+    for p in model.parameters():
+        assert p.name in name_mapping
+        if p.grad is not None:
+            grad = p.grad
+            reduce_dp(grad)
+            grad = merge_mp(name_mapping[p.name], grad)
+            print(f"[print_grad] {name_mapping[p.name][8:]} {p.name}_grad {grad.shape} {grad._md5sum()}")
+            # print(grad)
+    print(f"----------------------print_grad hand end -----------------------\n")
+
+
+def concat_dp(input):
+    hcg = fleet.get_hybrid_communicate_group()
+    dp_degree = hcg.get_data_parallel_world_size()
+    if dp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_data_parallel_group()
+        return concat(input, 0, group)
+
+
+def concat_mp(input, axis=-1):
+    hcg = fleet.get_hybrid_communicate_group()
+    mp_degree = hcg.get_model_parallel_world_size()
+    if mp_degree <= 1:
+        return input
+    else:
+        group = hcg.get_model_parallel_group()
+        return concat(input, axis, group)
+
+
+def concat(input, axis, group):
+    with paddle.no_grad():
+        inps = []
+        paddle.distributed.all_gather(inps, input, group=group)
+        return paddle.concat(x=inps, axis=axis)
 
 
 class Trainer:
@@ -263,9 +670,9 @@ class Trainer:
             output_dir = "tmp_trainer"
             logger.info(f"No `TrainingArguments` passed, using `output_dir={output_dir}`.")
             args = TrainingArguments(output_dir=output_dir)
-
         self.args = args
         self.is_in_train = False
+        self.file = ""
         # self.do_grad_scaling = args.fp16
 
         # memory metrics - must set up as early as possible
@@ -769,6 +1176,9 @@ class Trainer:
                 # so, the trainable numel is a little bigger than real.
                 logger.debug(f"  Number of trainable parameters = {trainable_numel:,} (all devices, roughly)")
 
+        if not self.args.enable_auto_parallel:
+            load_model_hand_yamei(model)
+
         return self._inner_training_loop(
             args,
             model,
@@ -887,6 +1297,17 @@ class Trainer:
 
         self.timers and self.timers("read-data").start()
 
+        tt = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        hcg = fleet.get_hybrid_communicate_group()
+        dp_degree = hcg.get_data_parallel_world_size()
+        mp_degree = hcg.get_model_parallel_world_size()
+        pp_degree = hcg.get_pipe_parallel_world_size()
+
+        self.file = open(
+            f"./records/hand_dp{dp_degree:02d}mp{mp_degree:02d}pp{pp_degree:02d}_tostatic_{self.args.to_static}_amp_{self.args.fp16}_{tt}.txt",
+            "w",
+        )
+
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, paddle.io.DataLoader) and isinstance(
                 train_dataloader.batch_sampler, DistributedBatchSampler
@@ -897,6 +1318,14 @@ class Trainer:
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             for step, inputs in enumerate(epoch_iterator):
+                # if step >= 1:
+                #     exit(0)
+                # print_inputs(inputs, step)
+                # print_param(model)
+                # print_grad(model)
+                # if step >= 1:
+                #     print_opt_param(self.optimizer.state_dict())
+
                 if self.args.use_hybrid_parallel and self.args.sep_parallel_degree > 1:
                     inputs = split_inputs_sequence_dim(inputs)
                 self.timers and self.timers("read-data").stop()
@@ -965,6 +1394,7 @@ class Trainer:
                     tr_loss_step = self.training_step(model, inputs)
 
                 tr_loss += tr_loss_step
+                # print(f"[YAMEI]step {step} loss: {tr_loss.numpy()} md5: {tr_loss._md5sum()}")
 
                 if (step_control + 1) % args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -1093,6 +1523,7 @@ class Trainer:
             if self.control.should_training_stop:
                 break
 
+        self.file.close()
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
             delattr(self, "_past")
@@ -1196,7 +1627,7 @@ class Trainer:
         if self.args.world_size <= 1:
             return paddle.io.BatchSampler(
                 dataset=self.train_dataset,
-                shuffle=True,
+                shuffle=False,
                 batch_size=self.args.per_device_train_batch_size,
                 drop_last=self.args.dataloader_drop_last,
             )
@@ -1204,7 +1635,7 @@ class Trainer:
         return DistributedBatchSampler(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
-            shuffle=True,
+            shuffle=False,
             num_replicas=self.args.dataset_world_size,
             rank=self.args.dataset_rank,
             drop_last=self.args.dataloader_drop_last,
@@ -1259,6 +1690,13 @@ class Trainer:
             logs["learning_rate"] = float("{0:.3e}".format(self._get_learning_rate()))
             logs["global_step"] = int(self.state.global_step)
 
+            log_loss(logs, self.file)
+            log_global_step = logs["global_step"]
+
+            # if log_global_step >= SAVE_MODEL_STEP:
+            #     save_model_yamei(model)
+            #     exit(0)
+
             total_train_batch_size = (
                 self.args.train_batch_size * self.args.gradient_accumulation_steps * self.args.dataset_world_size
             )
@@ -1275,8 +1713,6 @@ class Trainer:
                     seq_length=seq_length,
                 )
             )
-            logs["loss_md5"] = hashlib.md5(
-                np.array(tr_loss_scalar).tobytes()).hexdigest()
 
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
@@ -1973,6 +2409,7 @@ class Trainer:
             labels = None
 
         outputs = model(**inputs)
+        output = outputs
 
         if self.criterion is not None:
             loss = self.criterion(outputs, labels)
@@ -1991,6 +2428,11 @@ class Trainer:
             loss = outputs[0]
         else:
             loss = outputs
+
+        # if self.args.enable_auto_parallel:
+        #     print(f"\n[YAMEI]loss: {loss.numpy()} {loss._md5sum()}")
+        # else:
+        #     print(f"\n[YAMEI]loss: {loss.numpy()} {loss._md5sum()}")
 
         return (loss, outputs) if return_outputs else loss
 
@@ -2460,7 +2902,6 @@ class Trainer:
             # Load in optimizer and scheduler states
             self.optimizer.set_state_dict(opt_state_dict)
         else:
-            optimizer_name = _add_variant(OPTIMIZER_NAME, self.args.optimizer_name_suffix)
             raise ValueError(f"optimizer-state-dict not found, opt: {os.path.join(checkpoint, optimizer_name)}.")
 
         if not self.args.ignore_load_lr_and_optim:
@@ -2945,6 +3386,7 @@ class Trainer:
         Whether or not this process is the local (e.g., on one machine if training in a distributed fashion on several
         machines) main process.
         """
+        # return True
         return self.args.local_process_index == 0
 
     def is_world_process_zero(self) -> bool:

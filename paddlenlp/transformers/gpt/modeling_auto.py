@@ -18,10 +18,14 @@ from __future__ import annotations
 import collections
 import contextlib
 import math
+from calendar import c
 from functools import partial
+from re import X
+from symbol import return_stmt
 
 import numpy as np
 import paddle
+import paddle.distributed as dist
 import paddle.incubate as incubate
 import paddle.nn as nn
 import paddle.nn.functional as F
@@ -29,15 +33,18 @@ import paddle.tensor as tensor
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
-import paddle.distributed as dist
-
-from ...utils.converter import StateDictNameMapping
-from .. import PretrainedModel, register_base_model
-from ..model_outputs import BaseModelOutputWithPastAndCrossAttentions
-
 from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     ScatterOp,
     mark_as_sequence_parallel_parameter,
+)
+from paddle.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
+from ...utils.converter import StateDictNameMapping
+from ...utils.log import logger
+from .. import PretrainedModel, register_base_model
+from ..model_outputs import (
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions,
 )
 from .configuration import GPT_PRETRAINED_INIT_CONFIGURATION, GPTConfig
 
@@ -61,11 +68,25 @@ __all__ = [
 ]
 
 
+def bias_attr_true():
+    return False
+
+
+def layer_norm_bias_attr_true():
+    return True
+
+
 def get_mesh(pp_idx=0):
     mesh = fleet.auto.get_mesh()
     if "pp" in mesh.dim_names:
         mesh = mesh.get_mesh_with_dim("pp")[pp_idx]
+    # mesh = dist.ProcessMesh([[0],[1]], dim_names=["dp", "mp"])
     return mesh
+
+
+def weight_grad(grad):
+    zero = paddle.zeros(grad.shape, dtype="float16")
+    return zero
 
 
 def get_triangle_upper_mask(x, mask=None):
@@ -95,20 +116,14 @@ def _make_causal_mask(input_ids_shape, past_key_values_length):
     """
     batch_size, target_length = input_ids_shape  # target_length: seq_len
 
-    mask = paddle.tril(
-        paddle.ones((target_length, target_length), dtype="bool"))
+    mask = paddle.tril(paddle.ones((target_length, target_length), dtype="bool"))
 
     if past_key_values_length > 0:
         # [tgt_len, tgt_len + past_len]
-        mask = paddle.concat([
-            paddle.ones([target_length, past_key_values_length], dtype="bool"),
-            mask
-        ],
-                             axis=-1)
+        mask = paddle.concat([paddle.ones([target_length, past_key_values_length], dtype="bool"), mask], axis=-1)
 
     # [bs, 1, tgt_len, tgt_len + past_len]
-    return mask[None, None, :, :].expand(
-        [batch_size, 1, target_length, target_length + past_key_values_length])
+    return mask[None, None, :, :].expand([batch_size, 1, target_length, target_length + past_key_values_length])
 
 
 def _expand_2d_mask(mask, dtype, tgt_length):
@@ -125,6 +140,45 @@ def _expand_2d_mask(mask, dtype, tgt_length):
     return expanded_mask
 
 
+def print_grad(forward_name, message=""):
+    def _print_grad(grad):
+        print(f"\nprint_grad {forward_name}")
+        print(f"[local  g {message}] {grad._local_value().shape} {grad._local_value()._md5sum()}")
+        print(f"[global g {message}] {grad.shape} {grad._md5sum()}")
+        print(grad._local_value().numpy())
+        print(grad.numpy())
+        # tt = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        # if "w self.embeddings" in message:
+        #     print(f"\nprint_grad {forward_name} {message}")
+        #     print(grad._local_value())
+        #     print(grad)
+        #     np.save(f"./debug_grad/auto_{forward_name}_{tt}.txt", grad.numpy())
+
+    return _print_grad
+
+
+import hashlib
+
+
+def _md5sum(x):
+    numpy_array = x.numpy()
+    array_bytes = numpy_array.tobytes()
+    return hashlib.md5(array_bytes).hexdigest()
+
+
+def print_tensor(x, message="", register_hook=True):
+    # print(f"\nprint_tensor {x.name}")
+    if x._local_value().shape == [0]:
+        return
+    print(f"\nprint_tensor")
+    print(f"[local  {message}] {x._local_value().shape} {x._local_value()._md5sum()}")
+    print(f"[global {message}] {x.shape} {x._md5sum()}")
+    print(x._local_value().numpy())
+    print(x.numpy())
+    if register_hook:
+        x.register_hook(print_grad(x.name, message))
+
+
 class MultiHeadAttentionAuto(nn.Layer):
     """
     Attention mapps queries and a set of key-value pairs to outputs, and
@@ -135,7 +189,7 @@ class MultiHeadAttentionAuto(nn.Layer):
 
     Cache = collections.namedtuple("Cache", ["k", "v"])
 
-    def __init__(self, config, ipp=None):
+    def __init__(self, config, ipp: Optional[int] = None):
         super(MultiHeadAttentionAuto, self).__init__()
 
         self.config = config
@@ -146,51 +200,38 @@ class MultiHeadAttentionAuto(nn.Layer):
         self.use_flash_attention = config.use_flash_attention if flash_attention else False
 
         self.head_dim = config.hidden_size // config.num_attention_heads
-        assert (self.head_dim *
-                config.num_attention_heads == config.hidden_size
-                ), "hidden_size must be divisible by num_attention_heads"
+        assert (
+            self.head_dim * config.num_attention_heads == config.hidden_size
+        ), "hidden_size must be divisible by num_attention_heads"
 
         self.num_attention_heads = config.num_attention_heads  # default, without tensor parallel
         self.ipp = ipp
 
         if self.config.fuse_attention_qkv:
-            self.qkv_proj = nn.Linear(config.hidden_size,
-                                      3 * config.hidden_size,
-                                      bias_attr=True)
+            self.qkv_proj = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias_attr=bias_attr_true())
         else:
-            self.q_proj = nn.Linear(config.hidden_size,
-                                    config.hidden_size,
-                                    bias_attr=True)
-            self.k_proj = nn.Linear(config.hidden_size,
-                                    config.hidden_size,
-                                    bias_attr=True)
-            self.v_proj = nn.Linear(config.hidden_size,
-                                    config.hidden_size,
-                                    bias_attr=True)
+            self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
+            self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
+            self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
             self.q_proj.weight = dist.shard_tensor(
-                self.q_proj.weight, get_mesh(self.ipp),
-                [dist.Replicate(), dist.Shard(1)])
+                self.q_proj.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(1)]
+            )
             self.k_proj.weight = dist.shard_tensor(
-                self.k_proj.weight, get_mesh(self.ipp),
-                [dist.Replicate(), dist.Shard(1)])
+                self.k_proj.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(1)]
+            )
             self.v_proj.weight = dist.shard_tensor(
-                self.v_proj.weight, get_mesh(self.ipp),
-                [dist.Replicate(), dist.Shard(1)])
+                self.v_proj.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(1)]
+            )
 
-        self.out_proj = nn.Linear(config.hidden_size,
-                                  config.hidden_size,
-                                  bias_attr=True)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias_attr=bias_attr_true())
         self.out_proj.weight = dist.shard_tensor(
-            self.out_proj.weight, get_mesh(self.ipp),
-            [dist.Replicate(), dist.Shard(0)])
+            self.out_proj.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(0)]
+        )
 
     def _fuse_prepare_qkv(self, query, use_cache=False, past_key_value=None):
         if self.config.sequence_parallel:
             # [bs, seq_len, num_head * head_dim] -> [bs / n, seq_len, num_head, head_dim] (n is model parallelism)
-            target_shape = [
-                -1, self.config.seq_length, self.num_attention_heads,
-                3 * self.head_dim
-            ]
+            target_shape = [-1, self.config.seq_length, self.num_attention_heads, 3 * self.head_dim]
         else:
             target_shape = [0, 0, self.num_attention_heads, 3 * self.head_dim]
 
@@ -199,27 +240,20 @@ class MultiHeadAttentionAuto(nn.Layer):
         # bs, seq_len, num_head, 3*head_dim
         mix_layer = paddle.reshape_(mix_layer, target_shape)
         # query_states, key_states, value_states => bs, seq_len, num_head, head_dim
-        query_states, key_states, value_states = paddle.split(
-            mix_layer, num_or_sections=3, axis=-1)
+        query_states, key_states, value_states = paddle.split(mix_layer, num_or_sections=3, axis=-1)
 
         # [bs, seq_len, num_head, head_dim]
         if past_key_value is not None:
             # reuse k, v, self_attention
             # concat along seqlen dimension
             key_states = paddle.concat([past_key_value[0], key_states], axis=1)
-            value_states = paddle.concat([past_key_value[1], value_states],
-                                         axis=1)
+            value_states = paddle.concat([past_key_value[1], value_states], axis=1)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
         return query_states, key_states, value_states, past_key_value
 
-    def _prepare_qkv(self,
-                     query,
-                     key,
-                     value,
-                     use_cache=False,
-                     past_key_value=None):
+    def _prepare_qkv(self, query, key, value, use_cache=False, past_key_value=None):
         r"""
         Prapares linear projected queries, keys and values for usage of subsequnt
         multiple parallel attention. If `cache` is not None, using cached results
@@ -228,10 +262,7 @@ class MultiHeadAttentionAuto(nn.Layer):
         """
         if self.config.sequence_parallel:
             # [bs, seq_len, num_head * head_dim] -> [bs/n, seq_len, num_head * head_dim] (n is model parallelism)
-            target_shape = [
-                -1, self.config.seq_length, self.num_attention_heads,
-                self.head_dim
-            ]
+            target_shape = [-1, self.config.seq_length, self.num_attention_heads, self.head_dim]
         else:
             target_shape = [0, 0, self.num_attention_heads, self.head_dim]
 
@@ -252,19 +283,13 @@ class MultiHeadAttentionAuto(nn.Layer):
             # reuse k, v, self_attention
             # concat along seqlen dimension
             key_states = paddle.concat([past_key_value[0], key_states], axis=1)
-            value_states = paddle.concat([past_key_value[1], value_states],
-                                         axis=1)
+            value_states = paddle.concat([past_key_value[1], value_states], axis=1)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
         return query_states, key_states, value_states, past_key_value
 
-    def _flash_attention(self,
-                         q,
-                         k,
-                         v,
-                         attention_mask=None,
-                         output_attentions=False):
+    def _flash_attention(self, q, k, v, attention_mask=None, output_attentions=False):
         with seed_guard_context("local_seed"):
             out, weights = flash_attention(
                 query=q,
@@ -279,22 +304,14 @@ class MultiHeadAttentionAuto(nn.Layer):
         out = tensor.reshape(x=out, shape=[0, 0, out.shape[2] * out.shape[3]])
         return (out, weights) if output_attentions else out
 
-    def _core_attention(self,
-                        q,
-                        k,
-                        v,
-                        attention_mask=None,
-                        output_attentions=False):
+    def _core_attention(self, q, k, v, attention_mask=None, output_attentions=False):
         # [bs, seq_len, num_head, head_dim] -> [bs, num_head, seq_len, head_dim]
         perm = [0, 2, 1, 3]
         q = tensor.transpose(x=q, perm=perm)
         k = tensor.transpose(x=k, perm=perm)
         v = tensor.transpose(x=v, perm=perm)
         # scale dot product attention
-        product = paddle.matmul(
-            x=q * ((self.config.scale_qk_coeff * self.head_dim)**-0.5),
-            y=k,
-            transpose_y=True)
+        product = paddle.matmul(x=q * ((self.config.scale_qk_coeff * self.head_dim) ** -0.5), y=k, transpose_y=True)
         if self.config.scale_qk_coeff != 1.0:
             product = product.scale(self.config.scale_qk_coeff)
 
@@ -310,29 +327,21 @@ class MultiHeadAttentionAuto(nn.Layer):
 
         if self.config.attention_probs_dropout_prob:
             with seed_guard_context("local_seed"):
-                weights = F.dropout(weights,
-                                    self.config.attention_probs_dropout_prob,
-                                    training=self.training,
-                                    mode="upscale_in_train")
+                weights = F.dropout(
+                    weights, self.config.attention_probs_dropout_prob, training=self.training, mode="upscale_in_train"
+                )
 
         out = paddle.matmul(weights, v)
 
         # combine heads
-        out = tensor.transpose(out,
-                               perm=[0, 2, 1,
-                                     3])  # bs, seq_len, num_head, head_dim
+        out = tensor.transpose(out, perm=[0, 2, 1, 3])  # bs, seq_len, num_head, head_dim
         out = tensor.reshape(x=out, shape=[0, 0, -1])  # bs, seq_len, dim
 
         return (out, weights) if output_attentions else out
 
-    def forward(self,
-                query,
-                key,
-                value,
-                attention_mask=None,
-                use_cache=False,
-                past_key_value=None,
-                output_attentions=False):
+    def forward(
+        self, query, key, value, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False
+    ):
         r"""
         Applies multi-head attention to map queries and a set of key-value pairs
         to outputs.
@@ -341,12 +350,10 @@ class MultiHeadAttentionAuto(nn.Layer):
         value = query if value is None else value
         if self.config.fuse_attention_qkv:
             # [bs, seq_len, num_head, head_dim]
-            q, k, v, past_key_value = self._fuse_prepare_qkv(
-                query, use_cache, past_key_value)
+            q, k, v, past_key_value = self._fuse_prepare_qkv(query, use_cache, past_key_value)
         else:
             # [bs, seq_len, num_head, head_dim]
-            q, k, v, past_key_value = self._prepare_qkv(
-                query, key, value, use_cache, past_key_value)
+            q, k, v, past_key_value = self._prepare_qkv(query, key, value, use_cache, past_key_value)
 
         if self.config.use_flash_attention:
             # Flash Attention now ignore attention mask
@@ -361,22 +368,11 @@ class MultiHeadAttentionAuto(nn.Layer):
             # [bs, seq_len, num_head,]
             attention_func = self._core_attention
 
-        has_gradient = (not q.stop_gradient) or (not k.stop_gradient) or (
-            not v.stop_gradient)
+        has_gradient = (not q.stop_gradient) or (not k.stop_gradient) or (not v.stop_gradient)
         if self.enable_recompute and self.config.recompute_granularity == "core_attn" and has_gradient:
-            outputs = recompute(attention_func,
-                                q,
-                                k,
-                                v,
-                                attention_mask,
-                                output_attentions,
-                                use_reentrant=False)
+            outputs = recompute(attention_func, q, k, v, attention_mask, output_attentions, use_reentrant=False)
         else:
-            outputs = attention_func(q,
-                                     k,
-                                     v,
-                                     attention_mask=attention_mask,
-                                     output_attentions=output_attentions)
+            outputs = attention_func(q, k, v, attention_mask=attention_mask, output_attentions=output_attentions)
 
         if output_attentions:
             out, weights = outputs
@@ -388,16 +384,13 @@ class MultiHeadAttentionAuto(nn.Layer):
 
         if self.config.sequence_parallel:
             bs, seq_len, dim = out.shape
-            out = out.reshape(
-                [bs * seq_len,
-                 dim])  # [bs, seq_len, dim / n] => [bs * seq_len, dim / n]
+            out = out.reshape([bs * seq_len, dim])  # [bs, seq_len, dim / n] => [bs * seq_len, dim / n]
 
         # project to output
         out = self.out_proj(out)
         # if sequence_parallel is true, out shape are [bs * seq_len / n, dim]
         # else their shape are [bs, seq_len, dim], n is mp parallelism.
-        out = dist.reshard(out, get_mesh(self.ipp),
-                           [dist.Shard(0), dist.Replicate()])
+        # out = dist.reshard(out, get_mesh(self.ipp), [dist.Shard(0), dist.Replicate()])
         outs = [out]
         if output_attentions:
             outs.append(weights)
@@ -416,9 +409,11 @@ class TransformerDecoder(nn.Layer):
 
         self.config = config
         self.layers = decoder_layers
-        self.norm = nn.LayerNorm(config.hidden_size,
-                                 epsilon=1e-5,
-                                 bias_attr=True)
+        self.norm = nn.LayerNorm(
+            config.hidden_size,
+            epsilon=1e-5,
+            bias_attr=layer_norm_bias_attr_true(),
+        )
 
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm.weight)
@@ -438,9 +433,7 @@ class TransformerDecoder(nn.Layer):
         use_cache: bool,
         output_attentions: paddle.Tensor,
     ):
-
         def create_custom_forward(module):
-
             def custom_forward(*inputs):
                 return module(*inputs, output_attentions)
 
@@ -486,9 +479,7 @@ class TransformerDecoder(nn.Layer):
         pre_ipp = None
         for i, decoder_layer in enumerate(self.layers):
             if decoder_layer.ipp is not None and pre_ipp != decoder_layer.ipp:
-                output = dist.reshard(
-                    output, get_mesh(decoder_layer.ipp),
-                    [dist.Shard(0), dist.Replicate()])
+                output = dist.reshard(output, get_mesh(decoder_layer.ipp), [dist.Shard(0), dist.Replicate()])
             has_gradient = not output.stop_gradient
             if self.enable_recompute and has_gradient and self.config.recompute_granularity == "full_attn":
                 outputs = self.recompute_training(
@@ -504,30 +495,23 @@ class TransformerDecoder(nn.Layer):
                     output,
                     attention_mask=attention_mask,
                     use_cache=use_cache,
-                    past_key_value=past_key_values[i]
-                    if past_key_values is not None else None,
+                    past_key_value=past_key_values[i] if past_key_values is not None else None,
                     output_attentions=output_attentions,
                 )
 
             # outputs = hidden_states if both use_cache and output_attentions are False
             # Otherwise, outputs = (hidden_states, attention if output_attentions, cache if use_cache)
-            output = outputs[0] if (use_cache
-                                    or output_attentions) else outputs
-            all_self_attentions = all_self_attentions + (
-                outputs[1], ) if output_attentions else None
-            all_hidden_states = all_hidden_states + (
-                output, ) if output_hidden_states else None
-            next_decoder_cache = next_decoder_cache + (
-                outputs[-1], ) if use_cache else None
+            output = outputs[0] if (use_cache or output_attentions) else outputs
+            all_self_attentions = all_self_attentions + (outputs[1],) if output_attentions else None
+            all_hidden_states = all_hidden_states + (output,) if output_hidden_states else None
+            next_decoder_cache = next_decoder_cache + (outputs[-1],) if use_cache else None
             pre_ipp = decoder_layer.ipp
 
         if self.norm is not None:
             output = self.norm(output)
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
-            temp_list = [
-                output, next_cache, all_hidden_states, all_self_attentions
-            ]
+            temp_list = [output, next_cache, all_hidden_states, all_self_attentions]
 
             if not (use_cache or output_attentions or output_hidden_states):
                 return output
@@ -550,7 +534,7 @@ class GPTDecoderLayerAuto(nn.Layer):
     It contains multiheadattention and some linear layers.
     """
 
-    def __init__(self, config: GPTConfig, ipp=None):
+    def __init__(self, config: GPTConfig, ipp: Optional[int] = None):
         super(GPTDecoderLayerAuto, self).__init__()
         self.config = config
         self.ipp = ipp
@@ -563,26 +547,18 @@ class GPTDecoderLayerAuto(nn.Layer):
 
         self.self_attn = MultiHeadAttentionAuto(config, ipp)
 
-        self.linear1 = nn.Linear(config.hidden_size,
-                                 config.intermediate_size,
-                                 bias_attr=True)
-        self.linear2 = nn.Linear(config.intermediate_size,
-                                 config.hidden_size,
-                                 bias_attr=True)
+        self.linear1 = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias_attr=bias_attr_true(), name="yamei_linear1"
+        )
+        self.linear2 = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias_attr=bias_attr_true(), name="yamei_linear2"
+        )
 
-        self.linear1.weight = dist.shard_tensor(
-            self.linear1.weight, get_mesh(ipp),
-            [dist.Replicate(), dist.Shard(1)])
-        self.linear2.weight = dist.shard_tensor(
-            self.linear2.weight, get_mesh(ipp),
-            [dist.Replicate(), dist.Shard(0)])
+        self.linear1.weight = dist.shard_tensor(self.linear1.weight, get_mesh(ipp), [dist.Replicate(), dist.Shard(1)])
+        self.linear2.weight = dist.shard_tensor(self.linear2.weight, get_mesh(ipp), [dist.Replicate(), dist.Shard(0)])
 
-        self.norm1 = nn.LayerNorm(config.hidden_size,
-                                  epsilon=1e-5,
-                                  bias_attr=True)
-        self.norm2 = nn.LayerNorm(config.hidden_size,
-                                  epsilon=1e-5,
-                                  bias_attr=True)
+        self.norm1 = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=layer_norm_bias_attr_true())
+        self.norm2 = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=layer_norm_bias_attr_true())
 
         if config.sequence_parallel:
             mark_as_sequence_parallel_parameter(self.norm1.weight)
@@ -591,32 +567,26 @@ class GPTDecoderLayerAuto(nn.Layer):
             mark_as_sequence_parallel_parameter(self.norm2.bias)
 
         if config.use_fused_dropout_add:
-            self.fused_dropout_add1 = FusedDropoutAdd(
-                config.attention_probs_dropout_prob, mode="upscale_in_train")
-            self.fused_dropout_add2 = FusedDropoutAdd(
-                config.hidden_dropout_prob, mode="upscale_in_train")
+            self.fused_dropout_add1 = FusedDropoutAdd(config.attention_probs_dropout_prob, mode="upscale_in_train")
+            self.fused_dropout_add2 = FusedDropoutAdd(config.hidden_dropout_prob, mode="upscale_in_train")
         else:
-            self.dropout1 = nn.Dropout(config.attention_probs_dropout_prob,
-                                       mode="upscale_in_train")
-            self.dropout2 = nn.Dropout(config.hidden_dropout_prob,
-                                       mode="upscale_in_train")
+            self.dropout1 = nn.Dropout(config.attention_probs_dropout_prob, mode="upscale_in_train")
+            self.dropout2 = nn.Dropout(config.hidden_dropout_prob, mode="upscale_in_train")
 
         if config.hidden_activation == "gelu":
             self.activation = F.gelu
         else:
             self.activation = getattr(F, config.hidden_activation)
 
-    def forward(self,
-                hidden_states,
-                attention_mask=None,
-                use_cache=False,
-                past_key_value=None,
-                output_attentions=False):
+    def forward(
+        self, hidden_states, attention_mask=None, use_cache=False, past_key_value=None, output_attentions=False
+    ):
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         residual = hidden_states
         if self.config.normalize_before:
             hidden_states = self.norm1(hidden_states)
+            # print_tensor(hidden_states, f"norm1 {hidden_states.name}")
 
         # self.self_attn:
         # def forward(
@@ -637,16 +607,16 @@ class GPTDecoderLayerAuto(nn.Layer):
                 use_reentrant=False,
             )
         else:
-            hidden_states = self.self_attn(hidden_states, None, None,
-                                           attention_mask, use_cache,
-                                           past_key_value, output_attentions)
+            hidden_states = self.self_attn(
+                hidden_states, None, None, attention_mask, use_cache, past_key_value, output_attentions
+            )
+            # print_tensor(hidden_states, f"self_attn {hidden_states.name}")
 
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         incremental_cache = hidden_states[-1] if use_cache else None
         attention_weights = hidden_states[1] if output_attentions else None
-        hidden_states = hidden_states[0] if (
-            use_cache or output_attentions) else hidden_states
+        hidden_states = hidden_states[0] if (use_cache or output_attentions) else hidden_states
 
         # Use a ternary operator for a more concise assignment of current_seed
         current_seed = "local_seed" if self.config.sequence_parallel else "global_seed"
@@ -654,8 +624,7 @@ class GPTDecoderLayerAuto(nn.Layer):
         # The 'with' block ensures the correct seed context is used
         with seed_guard_context(current_seed):
             if self.config.use_fused_dropout_add:
-                hidden_states = self.fused_dropout_add1(
-                    hidden_states, residual)
+                hidden_states = self.fused_dropout_add1(hidden_states, residual)
             else:
                 hidden_states = residual + self.dropout1(hidden_states)
 
@@ -665,24 +634,27 @@ class GPTDecoderLayerAuto(nn.Layer):
         residual = hidden_states
         if self.config.normalize_before:
             hidden_states = self.norm2(hidden_states)
+            # print_tensor(hidden_states, f"norm2 {hidden_states.name}")
 
         # when sequence_parallel=True:
         # hidden_states => [bs * seq_len / n, embed_dim]
         with seed_guard_context(current_seed):
             if not self.config.use_fused_dropout_add:
-                act = self.activation(self.linear1(hidden_states),
-                                      approximate=True)
-                act = dist.reshard(act, get_mesh(
-                    self.ipp), [dist.Shard(0), dist.Shard(2)])
-                l_2 = self.linear2(act)
-                l_2 = dist.reshard(l_2, get_mesh(
-                    self.ipp), [dist.Shard(0), dist.Replicate()])
-                hidden_states = residual + self.dropout2(l_2)
+                a = self.linear1(hidden_states)
+                # print_tensor(a, f"yamei_linear1 {a.name}")
+                # print_tensor(self.linear1.weight, f"self.linear1.weight {self.linear1.weight.name}")
+
+                b = self.activation(a, approximate=True)
+                # b = dist.reshard(b, get_mesh(self.ipp), [dist.Shard(0), dist.Shard(2)])
+                c = self.linear2(b)
+                # print_tensor(c, f"yamei_linear2 {c.name}")
+                # c = dist.reshard(c, get_mesh(self.ipp), [dist.Shard(0), dist.Replicate()])
+                d = self.dropout2(c)
+                hidden_states = residual + d
             else:
                 hidden_states = self.fused_dropout_add2(
-                    self.linear2(
-                        self.activation(self.linear1(hidden_states),
-                                        approximate=True)), residual)
+                    self.linear2(self.activation(self.linear1(hidden_states), approximate=True)), residual
+                )
         if not self.config.normalize_before:
             hidden_states = self.norm2(hidden_states)
 
@@ -711,40 +683,30 @@ class GPTEmbeddingsAuto(nn.Layer):
 
         self.config = config
 
-        self.word_embeddings = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, name="yamei_word_embeddings")
 
         self.position_embeddings = nn.Embedding(
-            config.max_position_embeddings,
-            config.hidden_size,
+            config.max_position_embeddings, config.hidden_size, name="yamei_position_embeddings"
         )
         self.word_embeddings.weight = dist.shard_tensor(
-            self.word_embeddings.weight, get_mesh(),
-            [dist.Replicate(), dist.Shard(1)])
+            self.word_embeddings.weight, get_mesh(), [dist.Replicate(), dist.Shard(1)]
+        )
         self.position_embeddings.weight = dist.shard_tensor(
-            self.position_embeddings.weight, get_mesh(),
-            [dist.Replicate(), dist.Shard(1)])
+            self.position_embeddings.weight, get_mesh(), [dist.Replicate(), dist.Shard(1)]
+        )
+
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, input_ids, position_ids=None, inputs_embeddings=None):
         if position_ids is None and inputs_embeddings is None:
-            raise ValueError(
-                "You have to specify either `inputs_embeddings` or `position_ids`)"
-            )
+            raise ValueError("You have to specify either `inputs_embeddings` or `position_ids`)")
         if position_ids is not None and inputs_embeddings is not None:
-            raise ValueError(
-                "You cannot specify both `inputs_embeddings` and `position_ids`)"
-            )
-
-        # if input_ids is not None:
-        #     input_shape = paddle.shape(input_ids)
-        #     inputs_embeddings = self.word_embeddings(input_ids)
-
+            raise ValueError("You cannot specify both `inputs_embeddings` and `position_ids`)")
         if input_ids is not None:
             input_shape = input_ids.shape
             inputs_embeddings = self.word_embeddings(input_ids)
+            # print_tensor(inputs_embeddings,f"word_embeddings {inputs_embeddings.name}")
+            # print_tensor(self.word_embeddings.weight,f"self.word_embeddings.weight {self.word_embeddings.weight.name}")
         else:
             input_shape = paddle.shape(inputs_embeddings)[:-1]
 
@@ -752,15 +714,18 @@ class GPTEmbeddingsAuto(nn.Layer):
             ones = paddle.ones(input_shape, dtype="int64")
             seq_length = paddle.cumsum(ones, axis=-1)
             position_ids = seq_length - ones
+            # NOTE(zhaoyingli): infer spmd does not support [seq_len] --> [batch, seq_len] in data_parallel
 
+        position_ids = dist.shard_tensor(position_ids, get_mesh(), [dist.Shard(0), dist.Replicate()])
+        # print_tensor(position_ids, f"position_ids {position_ids.name}", False)
         position_embeddings = self.position_embeddings(position_ids)
+        # print_tensor(position_embeddings, f"position_embeddings {position_embeddings.name}")
         embeddings = inputs_embeddings + position_embeddings
 
         if self.config.sequence_parallel:
             bs, seq_len, hidden_size = embeddings.shape
             # [bs, seq_len, dim] -> [bs * seq_len, dim]
-            embeddings = paddle.reshape_(embeddings,
-                                         [bs * seq_len, hidden_size])
+            embeddings = paddle.reshape_(embeddings, [bs * seq_len, hidden_size])
             # [bs * seq_len / n, dim] (n is mp parallelism)
             embeddings = ScatterOp.apply(embeddings)
 
@@ -769,10 +734,9 @@ class GPTEmbeddingsAuto(nn.Layer):
         # The 'with' block ensures the correct seed context is used
         with seed_guard_context(current_seed):
             embeddings = self.dropout(embeddings)
-            embeddings = dist.reshard(
-                embeddings, get_mesh(),
-                [dist.Shard(0), dist.Replicate()])
-
+            # embeddings = dist.reshard(
+            #     embeddings, get_mesh(),
+            #     [dist.Shard(0), dist.Replicate()])
         return embeddings
 
 
@@ -811,35 +775,25 @@ class GPTPretrainedModelAuto(PretrainedModel):
                 "layers.0.linear1.bias": partial(fn, is_column=True),
                 # Row Linear
                 "word_embeddings.weight": partial(fn, is_column=False),
-                "layers.0.self_attn.out_proj.weight": partial(fn,
-                                                              is_column=False),
+                "layers.0.self_attn.out_proj.weight": partial(fn, is_column=False),
                 "layers.0.linear2.weight": partial(fn, is_column=False),
             }
 
             if config.fuse_attention_qkv:
-                base_actions["layers.0.self_attn.qkv_proj.weight"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.qkv_proj.bias"] = partial(
-                    fn, is_column=True)
+                base_actions["layers.0.self_attn.qkv_proj.weight"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.qkv_proj.bias"] = partial(fn, is_column=True)
             else:
-                base_actions["layers.0.self_attn.q_proj.weight"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.k_proj.weight"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.v_proj.weight"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.q_proj.bias"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.k_proj.bias"] = partial(
-                    fn, is_column=True)
-                base_actions["layers.0.self_attn.v_proj.bias"] = partial(
-                    fn, is_column=True)
+                base_actions["layers.0.self_attn.q_proj.weight"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.k_proj.weight"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.v_proj.weight"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.q_proj.bias"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.k_proj.bias"] = partial(fn, is_column=True)
+                base_actions["layers.0.self_attn.v_proj.bias"] = partial(fn, is_column=True)
 
             for key, action in base_actions.items():
                 if "layers.0." in key:
                     for i in range(num_layers):
-                        final_actions[key.replace("layers.0.",
-                                                  f"layers.{i}.")] = action
+                        final_actions[key.replace("layers.0.", f"layers.{i}.")] = action
                 final_actions[key] = action
 
             return final_actions
@@ -849,8 +803,7 @@ class GPTPretrainedModelAuto(PretrainedModel):
         return mappings
 
     @classmethod
-    def _get_name_mappings(cls,
-                           config: GPTConfig) -> list[StateDictNameMapping]:
+    def _get_name_mappings(cls, config: GPTConfig) -> list[StateDictNameMapping]:
         mappings: list[StateDictNameMapping] = []
         model_mappings = [
             ["wte.weight", "embeddings.word_embeddings.weight"],
@@ -860,46 +813,16 @@ class GPTPretrainedModelAuto(PretrainedModel):
         ]
         for layer_index in range(config.num_hidden_layers):
             layer_mappings = [
-                [
-                    f"h.{layer_index}.ln_1.weight",
-                    f"decoder.layers.{layer_index}.norm1.weight"
-                ],
-                [
-                    f"h.{layer_index}.ln_1.bias",
-                    f"decoder.layers.{layer_index}.norm1.bias"
-                ],
-                [
-                    f"h.{layer_index}.ln_2.weight",
-                    f"decoder.layers.{layer_index}.norm2.weight"
-                ],
-                [
-                    f"h.{layer_index}.ln_2.bias",
-                    f"decoder.layers.{layer_index}.norm2.bias"
-                ],
-                [
-                    f"h.{layer_index}.mlp.c_fc.weight",
-                    f"decoder.layers.{layer_index}.linear1.weight"
-                ],
-                [
-                    f"h.{layer_index}.mlp.c_fc.bias",
-                    f"decoder.layers.{layer_index}.linear1.bias"
-                ],
-                [
-                    f"h.{layer_index}.mlp.c_proj.weight",
-                    f"decoder.layers.{layer_index}.linear2.weight"
-                ],
-                [
-                    f"h.{layer_index}.mlp.c_proj.bias",
-                    f"decoder.layers.{layer_index}.linear2.bias"
-                ],
-                [
-                    f"h.{layer_index}.attn.c_proj.weight",
-                    f"decoder.layers.{layer_index}.self_attn.out_proj.weight"
-                ],
-                [
-                    f"h.{layer_index}.attn.c_proj.bias",
-                    f"decoder.layers.{layer_index}.self_attn.out_proj.bias"
-                ],
+                [f"h.{layer_index}.ln_1.weight", f"decoder.layers.{layer_index}.norm1.weight"],
+                [f"h.{layer_index}.ln_1.bias", f"decoder.layers.{layer_index}.norm1.bias"],
+                [f"h.{layer_index}.ln_2.weight", f"decoder.layers.{layer_index}.norm2.weight"],
+                [f"h.{layer_index}.ln_2.bias", f"decoder.layers.{layer_index}.norm2.bias"],
+                [f"h.{layer_index}.mlp.c_fc.weight", f"decoder.layers.{layer_index}.linear1.weight"],
+                [f"h.{layer_index}.mlp.c_fc.bias", f"decoder.layers.{layer_index}.linear1.bias"],
+                [f"h.{layer_index}.mlp.c_proj.weight", f"decoder.layers.{layer_index}.linear2.weight"],
+                [f"h.{layer_index}.mlp.c_proj.bias", f"decoder.layers.{layer_index}.linear2.bias"],
+                [f"h.{layer_index}.attn.c_proj.weight", f"decoder.layers.{layer_index}.self_attn.out_proj.weight"],
+                [f"h.{layer_index}.attn.c_proj.bias", f"decoder.layers.{layer_index}.self_attn.out_proj.bias"],
                 # attention
                 [
                     f"h.{layer_index}.attn.c_attn.weight",
@@ -947,17 +870,13 @@ class GPTPretrainedModelAuto(PretrainedModel):
                 mapping[0] = "transformer." + mapping[0]
                 mapping[1] = "gpt." + mapping[1]
         if "GPT2ForTokenClassification" in config.architectures:
-            model_mappings.extend(
-                [["classifier.weight", "classifier.weight", "transpose"]])
+            model_mappings.extend([["classifier.weight", "classifier.weight", "transpose"]])
         if "GPT2ForSequenceClassification" in config.architectures:
-            model_mappings.extend(
-                [["score.weight", "score.weight", "transpose"]])
+            model_mappings.extend([["score.weight", "score.weight", "transpose"]])
         if "GPT2LMHeadModel" in config.architectures:
             model_mappings.append(["lm_head.weight", "lm_head.decoder.weight"])
 
-        mappings = [
-            StateDictNameMapping(*mapping) for mapping in model_mappings
-        ]
+        mappings = [StateDictNameMapping(*mapping) for mapping in model_mappings]
         return mappings
 
 
@@ -1033,18 +952,14 @@ class GPTModelAuto(GPTPretrainedModelAuto):
         self.vocab_size = config.vocab_size
 
         self.bias = paddle.tril(
-            paddle.ones([
-                1, 1, config.max_position_embeddings,
-                config.max_position_embeddings
-            ],
-                        dtype="int64"))
+            paddle.ones([1, 1, config.max_position_embeddings, config.max_position_embeddings], dtype="int64")
+        )
 
         self.embeddings = GPTEmbeddingsAuto(config)
 
         decoder_layers = nn.LayerList()
         for i in range(config.num_hidden_layers):
-            decoder_layers.append(
-                GPTDecoderLayerAuto(config, self.get_layer_ipp(i)))
+            decoder_layers.append(GPTDecoderLayerAuto(config, self.get_layer_ipp(i)))
 
         self.decoder = TransformerDecoder(
             config,
@@ -1057,8 +972,7 @@ class GPTModelAuto(GPTPretrainedModelAuto):
             return None
         else:
             pp_degree = mesh.get_dim_size("pp")
-            layer_per_stage = math.ceil(self.config.num_hidden_layers /
-                                        pp_degree)
+            layer_per_stage = math.ceil(self.config.num_hidden_layers / pp_degree)
             return layer_index // layer_per_stage
 
     def get_last_layer_ipp(self):
@@ -1071,18 +985,16 @@ class GPTModelAuto(GPTPretrainedModelAuto):
         self.embeddings.word_embeddings = value
 
     @staticmethod
-    def _prepare_decoder_attention_mask(attention_mask, input_shape,
-                                        past_key_values_length, dtype):
+    def _prepare_decoder_attention_mask(attention_mask, input_shape, past_key_values_length, dtype):
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             if len(attention_mask.shape) == 2:
-                expanded_attn_mask = _expand_2d_mask(
-                    attention_mask, dtype, tgt_length=input_shape[-1])
+                expanded_attn_mask = _expand_2d_mask(attention_mask, dtype, tgt_length=input_shape[-1])
                 # For decoding phase in generation, seq_length = 1, we don't need to add causal mask
                 if input_shape[-1] > 1:
                     combined_attention_mask = _make_causal_mask(
-                        input_shape,
-                        past_key_values_length=past_key_values_length)
+                        input_shape, past_key_values_length=past_key_values_length
+                    )
                     # NOTE(zhaoyingli): infer spmd does not support [seq_len, seq_len] --> [batch, 1, seq_len, seq_len] in data_parallel
                     combined_attention_mask = dist.shard_tensor(
                         combined_attention_mask,
@@ -1097,12 +1009,9 @@ class GPTModelAuto(GPTPretrainedModelAuto):
             else:
                 expanded_attn_mask = attention_mask
         else:
-            expanded_attn_mask = _make_causal_mask(
-                input_shape, past_key_values_length=past_key_values_length)
+            expanded_attn_mask = _make_causal_mask(input_shape, past_key_values_length=past_key_values_length)
         # Convert bool attention_mask to float attention mask, which will be added to attention_scores later
-        expanded_attn_mask = paddle.where(
-            expanded_attn_mask, 0.0,
-            paddle.finfo(dtype).min).astype(dtype)
+        expanded_attn_mask = paddle.where(expanded_attn_mask, 0.0, paddle.finfo(dtype).min).astype(dtype)
         return expanded_attn_mask
 
     def forward(
@@ -1186,21 +1095,17 @@ class GPTModelAuto(GPTPretrainedModelAuto):
         """
 
         if self.config.sequence_parallel and use_cache:
-            raise ValueError(
-                "We currently only support sequence parallel without cache.")
+            raise ValueError("We currently only support sequence parallel without cache.")
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             input_shape = input_ids.shape
             input_ids = input_ids.reshape((-1, input_shape[-1]))
         elif inputs_embeds is not None:
             input_shape = paddle.shape(inputs_embeds)[:-1]
         else:
-            raise ValueError(
-                "You have to specify either input_ids or inputs_embeds")
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
         # input_shape => bs, seq_len
 
         if past_key_values is None:
@@ -1211,14 +1116,12 @@ class GPTModelAuto(GPTPretrainedModelAuto):
             if past_key_values[0] is not None:
                 # bs, seq_len, num_head, head_dim
                 past_length = paddle.shape(past_key_values[0][0])[1]
-            position_ids = paddle.arange(past_length,
-                                         input_shape[-1] + past_length,
-                                         dtype="int64")
+            position_ids = paddle.arange(past_length, input_shape[-1] + past_length, dtype="int64")
             position_ids = position_ids.unsqueeze(0)
             position_ids = paddle.expand(position_ids, input_shape)
-        embedding_output = self.embeddings(input_ids=input_ids,
-                                           position_ids=position_ids,
-                                           inputs_embeddings=inputs_embeds)
+        embedding_output = self.embeddings(
+            input_ids=input_ids, position_ids=position_ids, inputs_embeddings=inputs_embeds
+        )
         # TODO, use registered buffer
         length = input_shape[-1]
         if past_key_values[0] is not None:
@@ -1230,8 +1133,7 @@ class GPTModelAuto(GPTPretrainedModelAuto):
         causal_mask = self.bias[:, :, cache_length:length, :length]
         if attention_mask is not None:
             if attention_mask.dtype != paddle.int64:
-                attention_mask = paddle.cast(attention_mask,
-                                             dtype=paddle.int64)
+                attention_mask = paddle.cast(attention_mask, dtype=paddle.int64)
             if len(attention_mask.shape) == 2:
                 attention_mask = attention_mask[:, None, None, :]
             attention_mask = (1.0 - (attention_mask & causal_mask)) * -1e4
@@ -1253,11 +1155,10 @@ class GPTModelAuto(GPTPretrainedModelAuto):
 
         if output_hidden_states:
             if return_dict:
-                outputs.hidden_states = (
-                    embedding_output, ) + outputs.hidden_states
+                outputs.hidden_states = (embedding_output,) + outputs.hidden_states
             else:  # outputs is a tuple
                 idx = 2 if use_cache else 1
-                all_hidden_states = (embedding_output, ) + outputs[idx]
+                all_hidden_states = (embedding_output,) + outputs[idx]
                 outputs[idx] = all_hidden_states
 
         return outputs
@@ -1271,8 +1172,7 @@ class GPTPretrainingCriterionAuto(paddle.nn.Layer):
     def __init__(self, config):
         super(GPTPretrainingCriterionAuto, self).__init__()
         self.config = config
-        self.loss_func = paddle.nn.CrossEntropyLoss(
-            reduction="none", ignore_index=config.ignore_index)
+        self.loss_func = paddle.nn.CrossEntropyLoss(reduction="none", ignore_index=config.ignore_index)
 
     def forward(self, prediction_scores, masked_lm_labels, loss_mask=None):
         """
@@ -1293,20 +1193,25 @@ class GPTPretrainingCriterionAuto(paddle.nn.Layer):
             Tensor: The pretraining loss. Its data type should be float32 and its shape is [1].
 
         """
+        # with paddle.amp.auto_cast(False):
+        #     masked_lm_loss = self.loss_func(prediction_scores.astype("float32"), masked_lm_labels.unsqueeze(2))
+        #     # skip ignore_index which loss == 0
+        #     if loss_mask is None:
+        #         loss_mask = (masked_lm_loss > 0).astype("float32")
+        #         loss_mask = loss_mask.reshape([-1])
+        #     masked_lm_loss = paddle.sum(masked_lm_loss.reshape([-1]) * loss_mask)
+        #     loss = masked_lm_loss / loss_mask.sum()
         with paddle.amp.auto_cast(False):
-            masked_lm_loss = self.loss_func(
-                prediction_scores.astype("float32"),
-                masked_lm_labels.unsqueeze(2))
-            masked_lm_loss = paddle.masked_select(masked_lm_loss,
-                                                  masked_lm_loss
-                                                  > 0).astype("float32")
+            masked_lm_loss = self.loss_func(prediction_scores.astype("float32"), masked_lm_labels.unsqueeze(2))
+            # masked_lm_loss = dist.reshard(masked_lm_loss, get_mesh(), [dist.Replicate(), dist.Replicate()])
+
+            masked_lm_loss = paddle.masked_select(masked_lm_loss, masked_lm_loss > 0).astype("float32")
             loss = paddle.mean(masked_lm_loss)
         return loss
 
 
 class GPTLMHeadAuto(nn.Layer):
-
-    def __init__(self, config: GPTConfig, embedding_weights=None, ipp=None):
+    def __init__(self, config: GPTConfig, embedding_weights=None, ipp: Optional[int] = None):
         super(GPTLMHeadAuto, self).__init__()
         self.config = config
         self.transpose_y = True
@@ -1326,20 +1231,22 @@ class GPTLMHeadAuto(nn.Layer):
                 dtype=paddle.get_default_dtype(),
             )
             # Must set distributed attr for Tensor Parallel !
-            self.weight.is_distributed = True if (
-                vocab_size != config.vocab_size) else False
+            self.weight.is_distributed = True if (vocab_size != config.vocab_size) else False
             if self.weight.is_distributed:
                 self.weight.split_axis = 0
 
     def forward(self, hidden_states, tensor_parallel_output=None):
         if tensor_parallel_output is None:
             tensor_parallel_output = self.config.tensor_parallel_output
+        zero = paddle.zeros(self.weight.shape, dtype=self.weight.dtype)
+        zero = dist.reshard(zero, get_mesh(), [dist.Replicate(), dist.Shard(1)])
+        sum = self.weight + zero
 
-        y = dist.reshard(self.weight, get_mesh(self.ipp),
-                         [dist.Replicate(), dist.Shard(0)])
-        logits = paddle.matmul(hidden_states, y, transpose_y=self.transpose_y)
-        logits = dist.reshard(logits, get_mesh(self.ipp),
-                              [dist.Shard(0), dist.Replicate()])
+        x = dist.reshard(sum, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(1)])
+        # x.stop_gradient = True
+        # y = paddle.assign(x)
+        # y.stop_gradient = False
+        logits = paddle.matmul(hidden_states, x, transpose_y=self.transpose_y, name="yamei_logits")
         return logits
 
 
@@ -1358,9 +1265,8 @@ class GPTForCausalLMAuto(GPTPretrainedModelAuto):
         self.gpt = GPTModelAuto(config)
         self.ipp = self.gpt.get_last_layer_ipp()
         self.lm_head = GPTLMHeadAuto(
-            config,
-            embedding_weights=self.gpt.embeddings.word_embeddings.weight,
-            ipp=self.ipp)
+            config, embedding_weights=self.gpt.embeddings.word_embeddings.weight, ipp=self.ipp
+        )
 
         self.tie_weights()
         self.criterion = GPTPretrainingCriterionAuto(config)
@@ -1421,8 +1327,8 @@ class GPTForCausalLMAuto(GPTPretrainedModelAuto):
             Especialy, when `return_dict=use_cache=output_attentions=output_hidden_states=False`,
             returns a tensor `logits` which is the output of the gpt model.
         """
-        input_type = type(input_ids) if input_ids is not None else type(
-            inputs_embeds)
+        # input_ids.stop_gradient = True
+        input_type = type(input_ids) if input_ids is not None else type(inputs_embeds)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         outputs = self.gpt(
             input_ids,
@@ -1441,11 +1347,19 @@ class GPTForCausalLMAuto(GPTPretrainedModelAuto):
         else:
             hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        logits = dist.reshard(logits, get_mesh(self.ipp),
-                              [dist.Shard(0), dist.Replicate()])
+
+        # y = dist.reshard(self.gpt.embeddings.word_embeddings.weight, get_mesh(-1),
+        #                  [dist.Replicate(), dist.Shard(1)])
+        # logits = paddle.matmul(hidden_states, y, transpose_y=True)
+        # print_tensor(logits, f"yamei_logits {logits.name}")
+        # logits = dist.reshard(logits, get_mesh(self.ipp),
+        #                       [dist.Shard(0), dist.Replicate()])
+        # print(logits)
         return logits
 
-        # NOTE: The following code failed to run from dynamic to static mode
+        # 因为动转静不适配，以下逻辑注释掉。
+        # 但要给 AutoTrainer 配置 criterion，计算loss
+
         # loss = None
         # if labels is not None:
         #     loss = self.criterion(logits, labels)
@@ -1469,34 +1383,23 @@ class GPTForCausalLMAuto(GPTPretrainedModelAuto):
         use_fp16_decoding = kwargs.get("use_fp16_decoding", False)
         decode_strategy = kwargs.get("decode_strategy")
         if decode_strategy == "beam_search":
-            raise AttributeError(
-                "'beam_search' is not supported yet in the fast version of GPT"
-            )
+            raise AttributeError("'beam_search' is not supported yet in the fast version of GPT")
         # Currently, FasterTransformer only support restricted size_per_head.
-        size_per_head = self.gpt.config["hidden_size"] // self.gpt.config[
-            "num_attention_heads"]
+        size_per_head = self.gpt.config["hidden_size"] // self.gpt.config["num_attention_heads"]
         if size_per_head not in [32, 64, 80, 96, 128]:
             raise AttributeError(
-                "'size_per_head = %d' is not supported yet in the fast version of GPT"
-                % size_per_head)
+                "'size_per_head = %d' is not supported yet in the fast version of GPT" % size_per_head
+            )
         if kwargs["forced_bos_token_id"] is not None:
             # not support for min_length yet in the fast version
-            raise AttributeError(
-                "'forced_bos_token_id != None' is not supported yet in the fast version"
-            )
+            raise AttributeError("'forced_bos_token_id != None' is not supported yet in the fast version")
         if kwargs["min_length"] != 0:
             # not support for min_length yet in the fast version
-            raise AttributeError(
-                "'min_length != 0' is not supported yet in the fast version")
-        self._fast_entry = FasterGPT(
-            self, use_fp16_decoding=use_fp16_decoding).forward
+            raise AttributeError("'min_length != 0' is not supported yet in the fast version")
+        self._fast_entry = FasterGPT(self, use_fp16_decoding=use_fp16_decoding).forward
         return self._fast_entry
 
-    def prepare_inputs_for_generation(self,
-                                      input_ids,
-                                      use_cache=False,
-                                      past_key_values=None,
-                                      **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, use_cache=False, past_key_values=None, **kwargs):
         # only last token for inputs_ids if cache is defined in kwargs
         position_ids = kwargs.get("position_ids", None)
         # attention_mask = kwargs.get("attention_mask", None)
@@ -1513,12 +1416,11 @@ class GPTForCausalLMAuto(GPTPretrainedModelAuto):
         }
 
     @staticmethod
-    def prepare_attention_mask_for_generation(input_ids, pad_token_id,
-                                              eos_token_id):
-        is_pad_token_in_inputs_ids = (pad_token_id is not None) and float(
-            paddle.any(input_ids == pad_token_id))
+    def prepare_attention_mask_for_generation(input_ids, pad_token_id, eos_token_id):
+        is_pad_token_in_inputs_ids = (pad_token_id is not None) and float(paddle.any(input_ids == pad_token_id))
         is_pad_token_not_equal_to_eos_token_id = (eos_token_id is None) or (
-            (eos_token_id is not None) and (pad_token_id != eos_token_id))
+            (eos_token_id is not None) and (pad_token_id != eos_token_id)
+        )
         if is_pad_token_in_inputs_ids and is_pad_token_not_equal_to_eos_token_id:
             attention_mask = (input_ids != pad_token_id).astype("int64")
         else:

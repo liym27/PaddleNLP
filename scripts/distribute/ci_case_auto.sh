@@ -47,16 +47,16 @@ function gpt_case_list_auto() {
 
 function llama_case_list_auto() {
     llama_dygraph_auto_bs8_fp32_DP2
-    # llama_dygraph_auto_bs8_fp32_DP2-MP2
-    # llama_dygraph_auto_bs8_fp32_DP2-MP2-PP2
-    # llama_dygraph_auto_bs8_fp16_DP2-MP2-PP2
+    llama_dygraph_auto_bs8_fp32_DP2-MP2
+    llama_dygraph_auto_bs8_fp32_DP2-MP2-PP2
+    llama_dygraph_auto_bs8_fp16_DP2-MP2-PP2
 
-    # llama_static_auto_recompute_bs8_fp32_DP1-MP1-PP1
-    # llama_static_auto_recompute_bs16_fp32_DP2-MP1-PP1
-    # llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP1
-    # llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP2
-    # llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP2-VPP2-Sharding2_stage2
-    # llama_static_auto_recompute_bs16_fp16_DP2-MP2-PP2-VPP2-Sharding2_stage2
+    llama_static_auto_recompute_bs8_fp32_DP1-MP1-PP1
+    llama_static_auto_recompute_bs16_fp32_DP2-MP1-PP1
+    llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP1
+    llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP2
+    llama_static_auto_recompute_bs16_fp32_DP2-MP2-PP2-VPP2-Sharding2_stage2
+    llama_static_auto_recompute_bs16_fp16_DP2-MP2-PP2-VPP2-Sharding2_stage2
 }
 
 function gpt_case_list_auto_pir() {
