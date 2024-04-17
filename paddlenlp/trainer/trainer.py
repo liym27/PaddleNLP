@@ -1258,7 +1258,7 @@ class Trainer:
             logs["learning_rate"] = float("{0:.3e}".format(self._get_learning_rate()))
             logs["global_step"] = int(self.state.global_step)
 
-            divisor = 2**30
+            divisor = 2**20
             # TODO(@gexiao): replace these codes with unified APIs in Paddle
             current_device = framework._current_expected_place_()
             if str(current_device) != "Place(cpu)":
@@ -1267,10 +1267,10 @@ class Trainer:
                 current_memory_reserved = core.device_memory_stat_current_value("Reserved", device_id)
                 max_memory_allocated = core.device_memory_stat_peak_value("Allocated", device_id)
                 max_memory_reserved = core.device_memory_stat_peak_value("Reserved", device_id)
-                logs["current_memory_allocated"] = current_memory_allocated / divisor
-                logs["current_memory_reserved"] = current_memory_reserved / divisor
-                logs["max_memory_allocated"] = max_memory_allocated / divisor
-                logs["max_memory_reserved"] = max_memory_reserved / divisor
+                logs["cur_gpu_memory_allocated"] = f"{round(current_memory_allocated / divisor)} MB"
+                logs["cur_gpu_memory_reserved"] = f"{round(current_memory_reserved / divisor)} MB"
+                logs["max_gpu_memory_allocated"] = f"{round(max_memory_allocated / divisor)} MB"
+                logs["max_gpu_memory_reserved"] = f"{round(max_memory_reserved / divisor)} MB"
 
             total_train_batch_size = (
                 self.args.train_batch_size * self.args.gradient_accumulation_steps * self.args.dataset_world_size

@@ -56,16 +56,16 @@ python -u -m paddle.distributed.launch \
     --scale_loss 1024 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000005 \
-    --max_steps 30 \
+    --max_steps 3 \
     --save_steps 50000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \
     --max_grad_norm 0 \
-    --logging_steps 10 \
+    --logging_steps 1 \
     --continue_training 0\
     --dataloader_num_workers 1 \
     --eval_steps 100000 \
-    --report_to "visualdl" \
+    --report_to "none" \
     --disable_tqdm true \
     --gradient_accumulation_steps 1 \
     --do_train \

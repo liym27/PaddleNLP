@@ -864,11 +864,11 @@ class TrainerMemoryTracker:
                 if self.paddle is not None and stage in self.gpu and t in self.gpu[stage]:
                     metrics[f"{stage}_mem_gpu_{t}_delta"] = self.gpu[stage][t]
             # if we need additional debug info, enable the following
-            # for t in ["begin", "end"]:
-            #     if stage in self.cpu and t in self.cpu[stage]:
-            #         metrics[f"{stage}_mem_cpu_{t}"] = self.cpu[stage][t]
-            #     if self.paddle is not None and stage in self.gpu and t in self.gpu[stage]:
-            #         metrics[f"{stage}_mem_gpu_{t}"] = self.gpu[stage][t]
+            for t in ["begin", "end"]:
+                if stage in self.cpu and t in self.cpu[stage]:
+                    metrics[f"{stage}_mem_cpu_{t}"] = self.cpu[stage][t]
+                if self.paddle is not None and stage in self.gpu and t in self.gpu[stage]:
+                    metrics[f"{stage}_mem_gpu_{t}"] = self.gpu[stage][t]
 
         # since memory can be allocated before init, and it might be difficult to track overall
         # memory usage, in particular for GPU, let's report memory usage at the point init was called
@@ -878,10 +878,10 @@ class TrainerMemoryTracker:
                 metrics["before_init_mem_gpu"] = self.gpu["init"]["begin"]
             # if we also wanted to report any additional memory allocations in between init and
             # whatever the next stage was we could also report this:
-            # if self.cpu["init"]["end"] != self.cpu[stage]["begin"]:
-            #     metrics[f"after_init_mem_cpu_delta"] = self.cpu[stage]["begin"] - self.cpu["init"]["end"]
-            # if self.paddle is not None and self.gpu["init"]["end"] != self.gpu[stage]["begin"]:
-            #     metrics[f"after_init_mem_gpu_delta"] = self.gpu[stage]["begin"] - self.gpu["init"]["end"]
+            if self.cpu["init"]["end"] != self.cpu[stage]["begin"]:
+                metrics["after_init_mem_cpu_delta"] = self.cpu[stage]["begin"] - self.cpu["init"]["end"]
+            if self.paddle is not None and self.gpu["init"]["end"] != self.gpu[stage]["begin"]:
+                metrics["after_init_mem_gpu_delta"] = self.gpu[stage]["begin"] - self.gpu["init"]["end"]
 
     def stop_and_update_metrics(self, metrics=None):
         """combine stop and metrics update in one call for simpler code"""
