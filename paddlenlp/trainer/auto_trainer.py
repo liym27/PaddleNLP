@@ -267,6 +267,8 @@ class AutoTrainer(Trainer):
             npu_accelerate_plugin(self.optimizer)
 
         model, dist_loader = self._wrap_for_auto(model, train_dataloader)
+        if self.args.to_static:
+            logger.info(f"[DEBUG] strategy: {model._inner_strategy}")
         train_dataloader = dist_loader()
 
         self.timers and self.timers("read-data").start()
