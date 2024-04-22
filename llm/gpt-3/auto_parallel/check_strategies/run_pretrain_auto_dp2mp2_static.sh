@@ -19,11 +19,11 @@ export FLAGS_embedding_deterministic=1
 export NVIDIA_TF32_OVERRIDE=0
 export FLAGS_call_stack_level=3
 
-to_static=0
+to_static=1
 export TRANSLATOR_DISABLE_NEW_ERROR=0
-export TRANSLATOR_CODE_LEVEL=100
+# export TRANSLATOR_CODE_LEVEL=100
 
-task_name="gpt3_hand_dp2mp2pp2"
+task_name="gpt3_auto_dp2mp2_static_${to_static}"
 log_dir="log/$task_name"
 output_dir="output/$task_name"
 rm -rf $log_dir
@@ -32,9 +32,9 @@ rm -rf $log_dir
 input_dir="../../data"
 
 python -u -m paddle.distributed.launch \
-    --gpus "0,1,2,3,4,5,6,7" \
+    --gpus "4,5,6,7" \
     --log_dir ${log_dir} \
-    ../run_pretrain_hand.py \
+    ../run_pretrain_auto.py \
     --model_name_or_path gpt3-1.3B-en \
     --tokenizer_name_or_path gpt3-1.3B-en \
     --input_dir  ${input_dir}  \
@@ -44,15 +44,15 @@ python -u -m paddle.distributed.launch \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --tensor_parallel_degree 2 \
-    --pipeline_parallel_degree 2 \
+    --pipeline_parallel_degree 1 \
     --sequence_parallel 0 \
     --fp16 0 \
     --fp16_opt_level "O2"  \
-    --recompute 0 \
-    --recompute_granularity "" \
+    --recompute 1 \
+    --recompute_granularity "full_attn" \
     --use_flash_attention 0 \
     --fuse_attention_qkv 0 \
-    --sharding "stage1" \
+    --sharding "" \
     --scale_loss 1024 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000005 \
@@ -71,7 +71,7 @@ python -u -m paddle.distributed.launch \
     --do_train \
     --do_eval \
     --device "gpu" \
-    --enable_auto_parallel 0 \
-    --to_static "false" \
+    --model_type "gpt" \
+    --enable_auto_parallel 1 \
+    --to_static ${to_static} \
     --skip_memory_metrics 0 \
-

@@ -608,8 +608,8 @@ def main():
         # NOTE(gongenlei): new add
         if not training_args.autotuner_benchmark:
             metrics = train_result.metrics
-            if not int(os.getenv("test_ci_no_save_model", 0)):
-                trainer.save_model()
+            # if not int(os.getenv("test_ci_no_save_model", 0)):
+            #     trainer.save_model()
             trainer.log_metrics("train", metrics)
             trainer.save_metrics("train", metrics)
             trainer.save_state()

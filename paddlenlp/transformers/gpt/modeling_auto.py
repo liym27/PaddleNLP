@@ -313,7 +313,7 @@ class MultiHeadAttentionAuto(nn.Layer):
 
         has_gradient = (not q.stop_gradient) or (not k.stop_gradient) or (not v.stop_gradient)
         if self.enable_recompute and self.config.recompute_granularity == "core_attn" and has_gradient:
-            outputs = recompute(attention_func, q, k, v, attention_mask, output_attentions, use_reentrant=False)
+            outputs = recompute(attention_func, q, k, v, attention_mask, output_attentions, use_reentrant=True)
         else:
             outputs = attention_func(q, k, v, attention_mask=attention_mask, output_attentions=output_attentions)
 
@@ -387,7 +387,8 @@ class TransformerDecoder(nn.Layer):
             attention_mask,
             use_cache,
             past_key_value,
-            use_reentrant=self.config.recompute_use_reentrant,
+            # use_reentrant=self.config.recompute_use_reentrant,
+            use_reentrant=True,
         )
         return hidden_states
 
@@ -537,7 +538,7 @@ class GPTDecoderLayerAuto(nn.Layer):
                 use_cache,
                 past_key_value,
                 output_attentions,
-                use_reentrant=False,
+                use_reentrant=True,
             )
         else:
             hidden_states = self.self_attn(

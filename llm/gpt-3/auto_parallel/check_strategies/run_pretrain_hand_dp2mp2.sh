@@ -23,7 +23,7 @@ to_static=0
 export TRANSLATOR_DISABLE_NEW_ERROR=0
 export TRANSLATOR_CODE_LEVEL=100
 
-task_name="gpt3_hand_dp2mp2pp2"
+task_name="gpt3_hand_dp2mp2"
 log_dir="log/$task_name"
 output_dir="output/$task_name"
 rm -rf $log_dir
@@ -32,7 +32,7 @@ rm -rf $log_dir
 input_dir="../../data"
 
 python -u -m paddle.distributed.launch \
-    --gpus "0,1,2,3,4,5,6,7" \
+    --gpus "0,1,2,3" \
     --log_dir ${log_dir} \
     ../run_pretrain_hand.py \
     --model_name_or_path gpt3-1.3B-en \
@@ -44,15 +44,15 @@ python -u -m paddle.distributed.launch \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --tensor_parallel_degree 2 \
-    --pipeline_parallel_degree 2 \
+    --pipeline_parallel_degree 1 \
     --sequence_parallel 0 \
     --fp16 0 \
     --fp16_opt_level "O2"  \
-    --recompute 0 \
-    --recompute_granularity "" \
+    --recompute 1 \
+    --recompute_granularity "full_attn" \
     --use_flash_attention 0 \
     --fuse_attention_qkv 0 \
-    --sharding "stage1" \
+    --sharding "" \
     --scale_loss 1024 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000005 \
