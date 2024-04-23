@@ -46,22 +46,25 @@ python -u -m paddle.distributed.launch \
     --tensor_parallel_degree 2 \
     --pipeline_parallel_degree 2 \
     --sequence_parallel 0 \
+    --bf16 0 \
     --fp16 0 \
     --fp16_opt_level "O2"  \
-    --recompute 1 \
+    --recompute 0 \
     --recompute_granularity "core_attn" \
     --use_flash_attention 0 \
     --fuse_attention_qkv 0 \
+    --use_fused_dropout_add 0 \
+    --use_fast_layer_norm 1 \
     --sharding "" \
     --scale_loss 1024 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000005 \
-    --max_steps 30 \
+    --max_steps 1 \
     --save_steps 50000 \
     --weight_decay 0.01 \
     --warmup_ratio 0.01 \
     --max_grad_norm 0 \
-    --logging_steps 10 \
+    --logging_steps 1 \
     --continue_training 0\
     --dataloader_num_workers 1 \
     --eval_steps 100000 \

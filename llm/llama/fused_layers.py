@@ -15,6 +15,8 @@ import paddle
 from paddle import _C_ops
 from paddle.framework import core
 
+__all__ = ["mock_layers"]
+
 
 def is_fused_matmul_bias_supported():
     if paddle.is_compiled_with_cuda() and not paddle.is_compiled_with_rocm() or paddle.is_compiled_with_xpu():

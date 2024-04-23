@@ -52,7 +52,8 @@ python -u -m paddle.distributed.launch \
     --recompute_granularity "" \
     --use_flash_attention 0 \
     --fuse_attention_qkv 0 \
-    --sharding "stage1" \
+    --use_fused_dropout_add 1 \
+    --sharding "" \
     --scale_loss 1024 \
     --learning_rate 0.00001 \
     --min_learning_rate 0.000005 \

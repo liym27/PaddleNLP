@@ -48,10 +48,12 @@ python -u -m paddle.distributed.launch \
     --sequence_parallel 0 \
     --fp16 0 \
     --fp16_opt_level "O2"  \
-    --recompute 1 \
+    --recompute 0 \
     --recompute_granularity "core_attn" \
     --use_flash_attention 0 \
     --fuse_attention_qkv 0 \
+    --use_fused_dropout_add 0 \
+    --use_fast_layer_norm 1 \
     --sharding "" \
     --scale_loss 1024 \
     --learning_rate 0.00001 \

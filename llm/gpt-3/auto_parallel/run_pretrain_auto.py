@@ -263,6 +263,19 @@ class ModelArguments:
         metadata={"help": "recompute_use_reentrant"},
     )
 
+    use_fast_layer_norm: bool = field(
+        default=False,
+        metadata={"help": "GPT3 model, use fast layernorm"},
+    )
+    use_fused_linear: bool = field(
+        default=False,
+        metadata={"help": "GPT3 model, use fused linear layer"},
+    )
+    use_fused_dropout_add: bool = field(
+        default=False,
+        metadata={"help": "GPT3 model, use fused `dropout + residual add` op"},
+    )
+
 
 def create_pretrained_dataset(
     data_args,
