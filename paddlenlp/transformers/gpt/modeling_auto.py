@@ -32,13 +32,13 @@ from paddle.distributed.fleet.meta_parallel import get_rng_state_tracker
 from paddle.distributed.fleet.utils import recompute
 
 try:
-    from paddle.distributed.fleet.utils.sequence_parallel_utils import (
-        ScatterOp,
+    from paddle.distributed.fleet.utils.sequence_parallel_utils import (  # ScatterOp,
         mark_as_sequence_parallel_parameter,
     )
 except:
     pass
 from paddle.utils import try_import
+
 from ...utils.converter import StateDictNameMapping
 from .. import PretrainedModel, register_base_model
 from ..model_outputs import BaseModelOutputWithPastAndCrossAttentions
@@ -128,6 +128,7 @@ def _expand_2d_mask(mask, dtype, tgt_length):
     expanded_mask = mask.expand([batch_size, 1, tgt_length, src_length])
 
     return expanded_mask
+
 
 def _check_normalized_shape(normalized_shape):
     if isinstance(normalized_shape, (list, tuple)):
@@ -363,7 +364,6 @@ class TransformerDecoder(nn.Layer):
 
         self.config = config
         self.layers = decoder_layers
-        self.norm = nn.LayerNorm(config.hidden_size, epsilon=1e-5, bias_attr=True)
         self.norm = GPTLayerNorm(config, config.hidden_size, epsilon=1e-5)
 
         if config.sequence_parallel:
@@ -675,9 +675,10 @@ class GPTEmbeddingsAuto(nn.Layer):
             embeddings = self.dropout(embeddings)
         return embeddings
 
+
 class GPTLayerNorm(OriginLayerNorm):
     def __init__(self, config, normalized_shape, epsilon=1e-05, weight_attr=None, bias_attr=None, name=None):
-        super().__init__(
+        super(GPTLayerNorm, self).__init__(
             normalized_shape=normalized_shape, epsilon=epsilon, weight_attr=weight_attr, bias_attr=bias_attr
         )
 
@@ -687,7 +688,7 @@ class GPTLayerNorm(OriginLayerNorm):
     def forward(self, input):
         if self.config.use_fast_layer_norm:
             return fast_layer_norm(input, self.weight, self.bias, self._epsilon)
-        return super().forward(input)
+        return super(GPTLayerNorm, self).forward(input)
 
 
 class GPTPretrainedModelAuto(PretrainedModel):
@@ -1176,10 +1177,11 @@ class GPTLMHeadAuto(nn.Layer):
                 self.weight.split_axis = 0
 
     def forward(self, hidden_states, tensor_parallel_output=None):
-        if tensor_parallel_output is None:
-            tensor_parallel_output = self.config.tensor_parallel_output
+        if self.config.sequence_parallel:
+            # hidden_states = GatherOp.apply(hidden_states)
+            hidden_states = paddle.reshape_(hidden_states, [-1, self.config.seq_length, self.config.hidden_size])
 
-        y = dist.reshard(self.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(0)])
+        y = dist.reshard(self.weight, get_mesh(self.ipp), [dist.Replicate(), dist.Shard(1)])
         logits = paddle.matmul(hidden_states, y, transpose_y=self.transpose_y)
         return logits
 
