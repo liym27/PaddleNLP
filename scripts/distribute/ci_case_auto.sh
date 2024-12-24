@@ -1277,6 +1277,7 @@ function llama_align_dy2st_fthenb_and_vpp_auto_bs2_fp32_DP1-MP1-PP4() {
     export FLAGS_call_stack_level=3
     export NVIDIA_TF32_OVERRIDE=0
     export FLAGS_max_inplace_grad_add=3
+    export FLAGS_enable_p2p_comm_opt=1
 
     task_name="llama_align_dy2st_fthenb_and_vpp_auto_bs2_fp32_DP1_MP1_PP4"
     case_out_dir="output/$task_name"
@@ -1388,6 +1389,7 @@ function llama_align_dy2st_fthenb_and_vpp_auto_bs2_fp32_DP1-MP1-PP4() {
         echo "step=$step fthenb loss: ${loss1_array[$step-1]}, vpp loss: ${loss2_array[$step-1]}"
     done
     check_result $FUNCNAME ${loss1} ${loss2} ${ips_base} ${ips} ${mem_base} ${mem}
+    export FLAGS_enable_p2p_comm_opt=0
     echo "=========== $FUNCNAME run  end ==========="
 }
 
